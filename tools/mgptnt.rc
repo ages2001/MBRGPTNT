@@ -1,1 +1,5 @@
 1 ICON "mgptnt.ico"
+#define MG_DESC "MBRGPTNT Disk / Partition Manager"
+#define MG_NAME "mgptgui.exe"
+#define MG_TYPE 1
+#include "../src/mgptver.rc"

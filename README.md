@@ -46,8 +46,11 @@ binary; the i386 driver runs unchanged on all 32-bit releases.
   the right type byte chosen for you; partitions the in-box NT 3.x / 4.0
   disk driver ignores are mounted.
 - **Lossless GPT <-> MBR conversion** without moving data.
-- **File-system detection**: FAT12, FAT16, FAT32, NTFS, HPFS, exFAT, ReFS,
-  ext2, ext3, ext4, Btrfs.
+- **File-system detection**: 64 kinds - Windows, Linux (current and old),
+  Apple, BSD / Unix, optical (ISO 9660, UDF) and more; CD / DVD drives
+  and disks without a partition table are shown too.
+- **Disks past 2 TiB on 32-bit Windows**: the whole disk, through
+  MBRGPTNT's own 16-byte SCSI commands (AHCINT, SCSI cards).
 - **Hot-plug**: USB disks and card readers come and go while Windows runs.
 - **A graphical manager that runs on NT 3.1** and a command-line tool.
 - **x64** driver and tools for Windows XP x64 / Server 2003 x64.
@@ -58,8 +61,11 @@ binary; the i386 driver runs unchanged on all 32-bit releases.
 2. On 32-bit Windows run `i386\mbrginst.exe`, on x64 Windows
    `x64\mbrginst.exe`, as an Administrator.
 3. Restart Windows.
-4. Start `mgptgui` (Disk / Partition Manager) or `mgptpart` (command line)
-   — both are copied to `System32`, so they are on the PATH.
+4. Open the **MBRGPTNT** program group (Program Manager on NT 3.x, the
+   Start menu on NT 4.0 and later) and start **Disk / Partition Manager**,
+   or type `mgptgui` / `mgptpart` — the tools are copied to `System32`, so
+   they are on the PATH. **Uninstall MBRGPTNT** in the same group removes
+   everything again.
 
 ## What it does
 
@@ -99,12 +105,36 @@ binary; the i386 driver runs unchanged on all 32-bit releases.
   refused and the reason is shown.
 * **File-system detection**: the File system column names what is really
   on a partition or volume, read from the volume itself rather than guessed
-  from the type byte: FAT12, FAT16, FAT32 (by cluster count, as Microsoft's
-  specification defines it), NTFS, HPFS, exFAT, ReFS, ext2, ext3, ext4 and
-  Btrfs — also through the volume mapping of dynamic volumes. A partition
-  with no recognisable file system is shown as **RAW**; GPT reserved (MSR)
-  and LDM database partitions are named as such. Each kind has its own
-  color, and the legend lists the ones present.
+  from the type byte — also through the volume mapping of dynamic volumes:
+  - Windows: FAT12, FAT16, FAT32 (by cluster count, as Microsoft's
+    specification defines it), NTFS, exFAT, ReFS, HPFS, BitLocker
+  - Linux: ext2, ext3, ext4, the original ext, Btrfs, XFS, JFS, ReiserFS,
+    Reiser4, F2FS, NILFS2, bcachefs, GFS2, OCFS2, SquashFS, cramfs, EROFS,
+    romfs, JFFS2, Minix, Xiafs, Linux swap, LUKS, LVM2, Linux RAID (md 0.90
+    - 1.2)
+  - Apple: HFS, HFS+, HFSX, APFS, MFS, Core Storage, Apple boot
+  - BSD / Unix: UFS, UFS2, ZFS, HAMMER, HAMMER2, BSD swap, System V, Xenix,
+    UnixWare BFS, SGI EFS, VxFS, QNX6
+  - optical and others: UDF (all versions, 512 - 4096-byte blocks), ISO
+    9660, BeFS, Amiga FFS, VMFS, BIOS boot, EFI System
+
+  When a GPT partition holds no recognisable file system, its type GUID
+  still names it (Linux swap / LVM / RAID / LUKS, Apple HFS+ / APFS / boot
+  / Core Storage, FreeBSD UFS / ZFS / swap, Solaris ZFS, BIOS boot); on MBR
+  the type byte does (82 swap, 8E LVM, FD RAID, 83 Linux). Anything else is
+  shown as **RAW**; GPT reserved (MSR) and LDM database partitions are
+  named as such. A disk with no partition table but one file system over
+  all of it (a superfloppy, an ISO or UDF image, a whole-disk ext4 / XFS /
+  LUKS) is shown as such and left alone; Initialize gives it a table.
+  **CD / DVD drives** are listed too, with the file system on the disc
+  (ISO 9660, UDF, HFS, ...), shown only.
+
+  ![50 file systems on one GPT disk, two disks without a partition table and a UDF DVD on Windows 2000](docs/file-systems-w2k.png) Each kind has its own
+  color, and the legend lists the ones present. A partition reformatted
+  with another file system may still carry the old one's signatures; the
+  boot sector at its start decides (it belongs to the newest file system),
+  ReFS needs its full boot-sector header, and UDF needs both its volume
+  recognition sequence and an intact anchor at block 256.
 * **Disks that come and go**: a disk plugged in after start-up (a USB disk
   or stick, a card in a reader) is picked up within about 2 seconds: its
   partitions get volumes and drive letters, and the manager adds it on its
@@ -294,6 +324,38 @@ changed on NT 3.1 by adding a volume — imported back into Windows 2000.
   GPT (or any non-512 disk) is re-enumerated live with letters at once.
   File Manager is sent a device-change broadcast after a change; on the
   older releases press F5 if it does not refresh on its own.
+* **Disks larger than 2 TiB.** Sector numbers and sizes are 64-bit
+  throughout (driver, console and manager), sizes show in the largest unit
+  they fill (1024 MB and more as GB, 1024 GB as TB, 1024 TB as PB), and
+  a disk's size is taken from the disk itself (`IOCTL_DISK_GET_LENGTH_INFO`,
+  else partition 0's length) rather than from the cylinder count, so the
+  GPT backup lands on the real last sector. On Windows XP x64 the whole
+  disk is Windows' own. NT 3.x - XP i386 read and write with 32-bit sector
+  numbers and stop at 2 TiB (with 512-byte sectors); there MBRGPTNT asks
+  the disk for its real size (READ CAPACITY(16)) and reaches the rest
+  itself with READ(16) / WRITE(16) through the disk driver's SCSI
+  pass-through, so behind a controller driver that carries 16-byte
+  commands (AHCINT, SCSI cards) the **whole disk** is used: GPT initialize,
+  partitions anywhere, volumes past and across 2 TiB with drive letters,
+  formatted and written by Windows. The disk row says "past 2047.9 GB
+  through MBRGPTNT's own 16-byte commands". Where that path is not there
+  (IDE / ATA disk drivers), the part out of reach is hatched, partitions
+  reaching into it get no drive letter, the table is not rewritten (a GPT
+  written there would describe only 2 TiB) and a blank disk is offered MBR
+  only. Dynamic disks are not extended this way. MBR partitions end at
+  sector 2^32 - 1, the most an MBR entry holds.
+  Seen under emulation: Windows XP x64's IDE driver (atapi) cuts such a
+  disk's size to the low 32 bits; XP x64 then mounts partitions at wrong
+  places and rewrites the GPT backup copy inside the disk by itself. Use
+  disks past 2 TiB on XP x64 only behind a controller driver with 64-bit
+  sector numbers.
+* Which file system driver mounts a volume is decided by the file system
+  drivers, not by MBRGPTNT: Windows offers a new volume to each installed
+  file system in turn and the first that accepts it wins. A partition
+  that still carries an older file system's structures (UDF's recognition
+  sequence survives a ReFS or NTFS format, for example) can be taken by
+  the wrong driver. Wipe the start of a partition before reformatting it
+  with a different file system on another system.
 * Booting NT *from* a GPT or dynamic disk needs a loader that understands
   it and is out of scope here; MBRGPTNT is a boot-capable (system-start)
   driver but the firmware/loader side is separate.
@@ -303,13 +365,15 @@ changed on NT 3.1 by adding a volume — imported back into Windows 2000.
 ```
 i386/               Windows NT 3.1, 3.5, 3.51, 4.0, 2000, XP (32-bit)
   mbrgptnt.sys        the driver (one binary for all of these releases)
-  mbrginst.exe        installer: copies the driver and tools, registers the service
+  mbrginst.exe        installer: copies the driver and tools, registers the service,
+                      adds the MBRGPTNT program group
+  mbrgunin.exe        uninstaller
   mgptpart.exe        command-line tool
   mgptgui.exe         graphical Disk / Partition Manager
   nt31/ nt35/ nt40/   the same driver with subsystem 3.10 / 3.50 / 4.00 (optional)
 x64/                Windows XP x64 / Server 2003 x64
   mbrgptnt.sys        the x64 driver
-  mbrginst.exe  mgptpart.exe  mgptgui.exe   x64 builds of the tools
+  mbrginst.exe  mbrgunin.exe  mgptpart.exe  mgptgui.exe   x64 builds of the tools
 src/                driver and shared sources (one source for both architectures)
 tools/              build scripts, tool sources, the icon and its generator
 tests/              Linux test harnesses for the portable cores
@@ -321,10 +385,30 @@ docs/               screenshots
 On the target machine, from the `i386` folder (32-bit Windows) or the `x64`
 folder (x64 Windows), run `mbrginst` as an Administrator. It copies
 `mbrgptnt.sys` into `%SystemRoot%\System32\Drivers`, copies the tools
-(`mgptgui.exe`, `mgptpart.exe`, `mbrginst.exe`) into `%SystemRoot%\System32`
-so they are on the PATH, and creates the service
+(`mgptgui.exe`, `mgptpart.exe`, `mbrginst.exe`, `mbrgunin.exe`) into
+`%SystemRoot%\System32` so they are on the PATH, creates the service
 `HKLM\SYSTEM\CurrentControlSet\Services\mbrgptnt` (kernel driver, system
-start). Reboot to load it.
+start), and adds the **MBRGPTNT** program group — a common group in
+Program Manager on NT 3.x, a Start menu folder on NT 4.0 and later — with
+these items:
+
+| Item | Runs |
+|---|---|
+| Disk / Partition Manager | `mgptgui.exe` |
+| MBRGPTNT Command Line | a command prompt that shows `mgptpart`'s commands |
+| Uninstall MBRGPTNT | `mbrgunin.exe` |
+
+Reboot to load the driver. Installing over an earlier version works while
+that version runs: the files in use (its driver, a running manager) are
+replaced at the next restart.
+
+<img src="docs/program-group.png" alt="The MBRGPTNT program group on Windows NT 3.1" width="480">
+
+**Uninstalling.** *Uninstall MBRGPTNT* (or `mbrgunin`) asks for
+confirmation, then removes the program group, the service and the files;
+the files in use are deleted at the next restart. The data on the disks is
+not touched — after the restart, GPT partitions and dynamic volumes that
+only MBRGPTNT can mount are simply no longer visible.
 
 Use the x64 installer on x64 Windows: a 32-bit program there is redirected
 away from the real `System32`. XP x64 / 2003 x64 load the unsigned driver
@@ -368,7 +452,7 @@ runs on NT 3.1 too), laid out like a modern disk manager:
 
 Each operation opens its **own dialog** for its values: Create partition
 (FAT16 / FAT32 / NTFS / Extended / ... from a list - the exact type byte is
-chosen for you - or a byte in hex; size with a KB / MB / GB unit), Create
+chosen for you - or a byte in hex; size with a KB / MB / GB / TB / PB unit), Create
 dynamic volume (layout, size, and the disks to use, with each disk's free
 space), Change type (pre-filled with the partition's current type), Change
 drive letter (free letters only), Initialize (GPT or MBR), and confirmation
@@ -393,9 +477,11 @@ The manager's icon, drawn in the 16 VGA colors for NT 3.x / 4.0 and with
 
 ```
 mgptpart list                       list all disks (DynM / DynG = dynamic MBR / GPT)
-mgptpart show    <disk>             show a disk's partitions, or a dynamic disk's volume pieces
+mgptpart show    <disk>|cd<n>       show a disk's partitions, a dynamic disk's volume pieces,
+                                    or the file system on the disc in CD / DVD drive n
 mgptpart init    <disk> gpt|mbr     wipe and start an empty table
-mgptpart create  <disk> <type> [MB] create a partition (fat16|fat32|ntfs|ext or a hex byte; MB omitted = fill)
+mgptpart create  <disk> <type> [size] create a partition (fat16|fat32|ntfs|ext or a hex byte;
+                 size in MB, or with KB/MB/GB/TB/PB: 500, 750GB, 2TB; omitted = fill)
 mgptpart delete  <disk> <index>     delete a partition
 mgptpart settype <disk> <index> <type>  change a partition's type
 mgptpart active  <disk> <index> on|off   set/clear the active (boot) flag
@@ -447,7 +533,10 @@ and `python3` with `pefile` (and Pillow, only to redraw the icon).
 tools/build.sh all          # driver: nt31 / nt35 / nt40 (i386) and x64
 tools/buildtools.sh         # i386 mgptpart.exe, mgptgui.exe, mbrginst.exe -> build/tools
 tools/buildtools.sh x64     # x64 builds of the tools -> build/tools64
-python3 tools/mkicon.py tools/mgptnt.ico   # redraw the icon (16 VGA colors + 32-bit)
+python3 tools/mkicon.py tools/mgptnt.ico               # redraw the icons (16 VGA colors + 32-bit)
+python3 tools/mkicon.py tools/mgptcon.ico - console     #   badges: console, install, uninstall
+python3 tools/mkicon.py tools/mgptins.ico - install
+python3 tools/mkicon.py tools/mgptuni.ico - uninstall
 ```
 
 Import libraries are generated from each binary's own undefined symbols,
@@ -467,11 +556,17 @@ cc -std=gnu11 -Isrc -o tstchs   tests/tstchs.c   src/gptcore.c   # type-byte cho
 cc -std=gnu11 -Isrc -o tstebr   tests/tstebr.c   src/gptcore.c   # EBR chain after delete / create
 cc -Isrc -o tstldm  tests/tstldm.c  src/ldmcore.c src/gptcore.c  # read a disk group, dump / write its volumes
 cc -Isrc -o tstldmw tests/tstldmw.c src/ldmcore.c src/gptcore.c  # build a group with every layout
+cc -Isrc -o tstfs   tests/tstfs.c   src/gptcore.c   # file-system detection on an image
+cc -Isrc -o tstbig  tests/tstbig.c  src/gptcore.c   # a disk past 2 TiB, full and through 32-bit sector numbers
 ```
 
 `tstldm OUTDIR disk.img... [-miss N]` lists a disk group's disks and
 volumes and writes every volume out through the volume mapper, optionally
 pretending disk N is missing (degraded reads).
+
+`tests/tstioctl.c` is a Win32 console program (built like the tools, see
+`tools/buildtools.sh`): `tstioctl X:` prints what a volume answers to the
+size and position requests file systems send.
 
 ## Validation
 
@@ -482,9 +577,14 @@ Verified end to end under emulation:
   set active); drive letters shown and assigned from the first free letter
   up; drive-letter reassignment (system partition refused); lossless
   GPT <-> MBR conversion round-trip with partition offsets preserved;
-  file-system detection (FAT12/16/32, NTFS, HPFS, exFAT, ReFS, ext2/3/4,
-  Btrfs and RAW on one disk) in both the console and the graphical
-  manager; `mbrginst` install.
+  file-system detection (FAT12/16/32, NTFS, HPFS, exFAT, ReFS, UDF,
+  ext2/3/4, Btrfs and RAW on one disk; UDF with 512 - 4096-byte blocks;
+  ReFS formatted over UDF and the other way round) in both the console and the graphical
+  manager; `mbrginst` install over a running version, the program group
+  and its items, `mbrgunin` uninstall; a FAT16 volume on a GPT disk with
+  2,400 files in 42 folders (0 bytes to 6 MB) copied within the volume,
+  partly deleted and checked on the host (`fsck`, checksums); the volume
+  size and position requests of Windows 2000 / XP answered per volume.
 * **NT 3.1 SP0, dynamic disks** — a group with all five layouts: files read
   and written on each volume (checked on the host, also with each disk in
   turn left out: mirror copies and RAID-5 parity consistent); volumes
@@ -497,6 +597,38 @@ Verified end to end under emulation:
   partition, simple, spanned and striped volumes) mounted with Windows'
   letters, a volume added to it, the group imported back into Windows 2000;
   a group with a disk missing shown and mounted degraded.
+* **File systems** — each made by its own tools on Linux (mkfs.ext2/3/4,
+  mkfs.xfs, mkfs.jfs, mkreiserfs, mkfs.reiser4, mkfs.f2fs, mkfs.nilfs2,
+  bcachefs, mkswap, mkfs.btrfs, mkfs.minix, mkfs.hfs / hfsplus, mkfs.gfs2,
+  mkfs.ocfs2, mkudffs, cryptsetup (LUKS 1 and 2), mksquashfs, mkfs.cramfs,
+  mkfs.erofs, xorriso and makefs (ISO 9660), mkapfs, makefs (UFS1, UFS2),
+  genromfs, mkfs.jffs2, pvcreate, mkfs.exfat / ntfs / vfat) or, where no
+  tool runs here (md RAID, ZFS, BitLocker, BeFS, VxFS, System V, Xenix,
+  Xiafs, the original ext, MFS, Amiga, QNX6, VMFS, HAMMER, HAMMER2, BFS,
+  EFS), with its signature written at its place; each detected alone, as a
+  whole disk and among 50 partitions of one GPT disk; GPT type GUIDs of
+  empty partitions named. On Windows 2000: that disk shown with all 50
+  file systems, a whole-disk ext4 and a FAT superfloppy shown as disks
+  without a partition table, and a UDF DVD in an IDE drive shown as
+  CD-ROM 0 with Windows' drive letter.
+* **Disks past 2 TiB** — on the host: GPT disks of 3 TiB (512-byte
+  sectors) and 12 TiB (4096-byte sectors) parsed, extended at the end and
+  written with the backup on the real last sector (`sgdisk -v`); the same
+  3 TiB disk seen through 32-bit sector numbers shows the partitions past
+  2 TiB as out of reach and every write is refused. On Windows 2000 with
+  AHCINT 1.6 (which reports 2^32 - 1 sectors there) and a 3 TiB disk made
+  on Linux: a FAT32 volume wholly past 2 TiB and an NTFS volume across it
+  mounted with drive letters, the Linux-written file read, 141 files and
+  `ntoskrnl.exe` copied onto both, `chkdsk` clean; a blank 3 TiB disk
+  initialized as GPT over its whole size, a 2.1 TiB partition created and
+  quick-formatted NTFS by Windows 2000 and filled. Checked on the host:
+  `sgdisk -v` clean with the backup on the last sector, `fsck.fat` and
+  `ntfsfix` clean, every copied file identical, the NTFS backup boot sector
+  (past 2 TiB) identical to the first. On NT 3.1 a GPT disk whose last
+  partition ends in the partial last cylinder keeps its volume, and its
+  table is not rewritten over that partition's end.
+
+  ![A 3 TiB GPT disk on Windows 2000: the whole disk in use through MBRGPTNT's own 16-byte commands](docs/large-disk-w2k.png)
 * **Windows XP x64** — the x64 driver and tools: the NT 3.1-made mixed
   MBR / GPT group imported by Windows (simple, spanned and striped volumes
   healthy, files identical); MBRGPTNT showing the group as managed by
@@ -510,8 +642,8 @@ Verified end to end under emulation:
   in-box driver serves only the first); pulling a stick while a command
   prompt is in one of its directories; re-plugging; swapping one stick for
   another within 2 s.
-* **NT 4.0 SP6** and **Windows 2000** — driver load, GPT read/write,
-  list/show/create/delete.
+* **NT 4.0 SP6** and **Windows 2000** (disk behind AHCINT) — driver load,
+  GPT read/write, list/show/create/delete.
 
 The portable cores are checked on Linux: `gptcore` against `sgdisk`- and
 `sfdisk`-made images (GPT with backup fall-back, MBR with extended/logical
@@ -536,5 +668,9 @@ src/mgptioc.h       control-device IOCTL interface (shared with the tools)
 tools/mgptpart.c    command-line tool
 tools/mgptgui.c     graphical Disk / Partition Manager
 tools/mbrginst.c    installer
-tools/mkicon.py     draws the icon (tools/mgptnt.ico, linked in via mgptnt.rc)
+tools/mbrgunin.c    uninstaller
+tools/pmgroup.h     the program group (Program Manager DDE), shared by both
+tools/mkicon.py     draws the icons: the manager's (mgptnt.ico) and, with a badge,
+                    the command line's (mgptcon.ico), the installer's
+                    (mgptins.ico) and the uninstaller's (mgptuni.ico)
 ```

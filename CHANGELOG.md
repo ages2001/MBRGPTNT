@@ -1,5 +1,109 @@
 # MBRGPTNT changelog
 
+## v1.1.0.0
+
+- The installer adds an **MBRGPTNT** program group: Disk / Partition
+  Manager, MBRGPTNT Command Line (a command prompt showing `mgptpart`'s
+  commands) and Uninstall MBRGPTNT. On NT 3.x it is a common group in
+  Program Manager, on NT 4.0 and later a Start menu folder. Reinstalling
+  replaces the group instead of adding a second one.
+- New uninstaller, `mbrgunin.exe`: after a confirmation it removes the
+  program group, the service and the files; files in use are deleted at
+  the next restart. The data on the disks is not touched.
+- Installing over a running version works: files in use (the loaded
+  driver, a running manager) are replaced at the next restart. Before, the
+  installer stopped on NT 3.x when the driver file was in use.
+- Every tool has its own icon: the manager's disk, with a command prompt
+  badge for `mgptpart`, a green arrow for the installer and a red cross
+  for the uninstaller - in 16 VGA colors for NT 3.x / 4.0 and in 32-bit
+  color for XP.
+- `mgptpart` help fits in 80 columns.
+- **File-system detection covers 64 kinds** (it knew 15): besides FAT,
+  NTFS, exFAT, ReFS, HPFS, ext2/3/4 and Btrfs now
+  - Linux: XFS, JFS, ReiserFS, Reiser4, F2FS, NILFS2, bcachefs, GFS2,
+    OCFS2, SquashFS, cramfs, EROFS, romfs, JFFS2, Minix, the original ext,
+    Xiafs, Linux swap, LUKS 1 / 2, LVM2, Linux RAID (md 0.90, 1.0, 1.1,
+    1.2);
+  - Apple: HFS, HFS+, HFSX, APFS, MFS, Core Storage, Apple boot;
+  - BSD / Unix: UFS, UFS2, ZFS, HAMMER, HAMMER2, BSD swap, System V, Xenix,
+    UnixWare BFS, SGI EFS, VxFS, QNX6;
+  - optical and others: **UDF** (UDF 1.02 - 2.60, blocks of 512 - 4096
+    bytes; taken as UDF only when both its volume recognition sequence and
+    its anchor at block 256 are valid), ISO 9660, BeFS, Amiga FFS, VMFS,
+    BitLocker, BIOS boot.
+  Each has its own color in the manager. A GPT partition with no file
+  system found is named by its type GUID where that says more (Linux swap,
+  LVM, RAID, LUKS; Apple HFS+, APFS, boot, Core Storage; FreeBSD UFS, ZFS,
+  swap; Solaris ZFS; BIOS boot), an MBR one by its type byte (82, 8E, FD).
+- **Disks without a partition table** holding one file system (a
+  superfloppy, an ISO or UDF image, a whole-disk ext4 / XFS / LUKS) are
+  shown as such instead of as garbage partitions; nothing is written to
+  them and no volume is published. Initialize gives them a table.
+- **CD / DVD drives** are listed in the manager and by `mgptpart list` /
+  `show cd<n>`, with the file system on the disc (ISO 9660, UDF on CD, DVD
+  and BD, HFS, ...) and its drive letter; shown only.
+- **ReFS** detection is stricter: the whole boot-sector header ("FSRS"
+  structure, sector and cluster size) must be valid, not only the name. A
+  partition reformatted from ReFS to UDF or from UDF to ReFS keeps parts of
+  the old file system; the boot sector, which belongs to the newer one,
+  now decides, so such a partition is no longer shown as the wrong one.
+- Volumes answer the size and position requests of Windows 2000 / XP
+  themselves (`IOCTL_DISK_GET_LENGTH_INFO`, `IOCTL_DISK_GET_PARTITION_INFO_EX`,
+  `IOCTL_DISK_SET_PARTITION_INFO_EX`, `IOCTL_STORAGE_GET_DEVICE_NUMBER`).
+  Before, these went to the disk, which answered for the whole disk: a file
+  system that took the volume size from them (UDF looks for its last
+  anchor at the end of the volume) looked past the volume, and every volume
+  of a disk reported the same device number.
+- **Disks larger than 2 TiB used whole on 32-bit Windows.**
+  - NT 3.x - XP i386 read and write disks with 32-bit sector numbers
+    (READ(10) / WRITE(10)) and stop at 2 TiB. MBRGPTNT now asks such a disk
+    for its real size (READ CAPACITY(16)) and reads and writes the part
+    past 2 TiB itself with READ(16) / WRITE(16), sent through the disk
+    driver's SCSI pass-through to the controller driver (AHCINT, a SCSI
+    card). The whole disk is then used: GPT initialize, partitions of any
+    size anywhere on the disk, volumes past or across 2 TiB mounted with
+    drive letters, formatted and written by Windows (FAT32 and NTFS
+    tested). Requests below 2 TiB keep the disk driver's normal path.
+  - A partitioned and formatted disk (made on another system) works the
+    same way: its volumes past 2 TiB get drive letters and can be read and
+    written.
+  - Where the controller driver cannot carry 16-byte commands (IDE / ATA
+    disk drivers), the disk is shown with its real size, the part out of
+    reach is hatched in the disk map, partitions reaching past it get no
+    drive letter, and the table is not rewritten (a GPT written there
+    would describe only 2 TiB, and its backup copy would land inside the
+    disk); only MBR is offered on a blank disk.
+  - Dynamic disks are not extended this way: a dynamic volume's pieces
+    past 2 TiB count as missing there, and such a disk is not converted
+    between basic and dynamic.
+  - Windows 2000 reports a disk past 2 TiB as 0 bytes when the controller
+    driver answers FFFFFFFFh; MBRGPTNT takes the size from the device.
+  - The manager showed sizes past 2^32 sectors wrongly (cut to 32 bits: a
+    3 TB disk appeared as about 750 GB) and placed such partitions wrongly
+    in the disk map; `mgptpart` printed them in hexadecimal. Sector numbers
+    are 64-bit everywhere now, and sizes show in KB, MB, GB, TB or PB.
+  - The disk size is read from the disk (`IOCTL_DISK_GET_LENGTH_INFO`,
+    else partition 0's length, checked by reading the last sector, or the
+    table's own end when it can be read) instead of being computed from
+    the cylinder count, which leaves out the partial last cylinder. A GPT
+    written by MBRGPTNT has its backup on the real last sector wherever the
+    disk driver reaches it (NT 3.x's atdisk does not).
+  - A partition table is never written when a partition reaches into the
+    GPT backup area at the end of the reachable disk; before, the backup
+    copy could overwrite the end of the last partition.
+  - MBR partitions end at sector 2^32 - 1 at most, the largest value an
+    MBR entry holds.
+  - Every size is shown in the largest unit it fills at least once: 1024
+    MB and more as GB, 1024 GB and more as TB, 1024 TB and more as PB
+    ("1.4 GB", "2.7 TB", "1.5 PB"), in the manager, its dialogs and
+    `mgptpart` alike.
+  - Sizes are entered in KB, MB, GB, TB or PB: the New partition dialog
+    has TB and PB in its unit list, and `mgptpart create` takes a unit
+    after the number (`750GB`, `2TB`; MB when there is none).
+  - The New partition dialog says how large the free area is when the
+    size entered does not fit, instead of a general failure message.
+- Version information (1.1.0.0) in the driver and every tool.
+
 ## v1.0.0.0
 
 First release. MBR, GPT and dynamic disk (LDM) driver and tools for

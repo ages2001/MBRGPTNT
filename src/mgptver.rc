@@ -1,0 +1,36 @@
+/* mgptver.rc - version resource shared by the driver and the tools.
+   An including .rc file sets MG_DESC, MG_NAME and MG_TYPE first. */
+#ifndef MG_DESC
+#define MG_DESC "MBRGPTNT MBR, GPT and dynamic disk driver"
+#define MG_NAME "mbrgptnt.sys"
+#define MG_TYPE 3
+#endif
+
+1 VERSIONINFO
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
+FILEFLAGSMASK 0x3F
+FILEFLAGS 0
+FILEOS 0x40004
+FILETYPE MG_TYPE
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "ages2001"
+            VALUE "FileDescription", MG_DESC
+            VALUE "FileVersion", "1.1.0.0"
+            VALUE "InternalName", MG_NAME
+            VALUE "LegalCopyright", "Copyright (C) 2026 ages2001"
+            VALUE "OriginalFilename", MG_NAME
+            VALUE "ProductName", "MBRGPTNT"
+            VALUE "ProductVersion", "1.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

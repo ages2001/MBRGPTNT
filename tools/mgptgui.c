@@ -136,6 +136,7 @@ typedef LONG_PTR       LRESULT;
 #define IDC_ARROW ((LPCSTR)(ULONG_PTR)32512)
 #define IDC_WAIT  ((LPCSTR)(ULONG_PTR)32514)
 #define HS_FDIAGONAL 3
+#define HS_DIAGCROSS 5
 #define SRCCOPY  0x00CC0020UL
 #define BITSPIXEL 12
 #define PLANES    14
@@ -231,6 +232,7 @@ __declspec(dllimport) BOOL   WINAPI DeleteDC(HDC);
 __declspec(dllimport) int    WINAPI GetDeviceCaps(HDC,int);
 
 #include "../src/mgptioc.h"
+#include "../src/gptcore.h"   /* GPT_FS_* kinds and their names */
 
 /* ------------------------------------------------------------------ */
 /* commands and icons                                                 */
@@ -350,21 +352,42 @@ static void scopy(char*d,const char*s){while((*d++=*s++)!=0);}
 static void scat(char*d,const char*s){while(*d)d++;scopy(d,s);}
 static void sjoin(char*d,const char*s){if(d[0])scat(d,", ");scat(d,s);}
 
-static DWORD u64lo(mgpt_u64 v){ union{mgpt_u64 q;struct{DWORD lo,hi;}p;}u; u.q=v; return u.p.lo; }
-static DWORD perMB(DWORD ss){ DWORD p=1048576u/ss; return p?p:1; }
-static DWORD toMB(mgpt_u64 sectors, DWORD ss){ return u64lo(sectors)/perMB(ss); }
-
-static void sizestr(mgpt_u64 sectors, DWORD ss, char*out){
-    DWORD mb=toMB(sectors,ss);
-    if(mb>=10240) wsprintfA(out,"%lu.%lu GB",mb/1024,((mb%1024)*10)/1024);
-    else wsprintfA(out,"%lu MB",mb);
+/* Sector numbers and counts stay 64-bit everywhere: a disk past 2 TiB has
+   more than 2^32 sectors. The sector sizes are powers of two, so sectors
+   become MB by a shift; the one real division (the disk map's scale) is
+   udiv64, as the tools link no C run-time. */
+static DWORD u64lo(mgpt_u64 v){ return (DWORD)(v&0xFFFFFFFFu); }
+static int   mbShift(DWORD ss){ int k=20; while(ss>1&&k>0){ ss>>=1; k--; } return k; }
+static DWORD perMB(DWORD ss){ return 1UL<<mbShift(ss); }
+static mgpt_u64 toMB(mgpt_u64 sectors, DWORD ss){ return sectors>>mbShift(ss); }
+static mgpt_u64 udiv64(mgpt_u64 n, mgpt_u64 d){
+    mgpt_u64 q=0, r=0; int i;
+    if(!d) return 0;
+    for(i=63;i>=0;i--){ r=(r<<1)|((n>>i)&1); if(r>=d){ r-=d; q|=(mgpt_u64)1<<i; } }
+    return q;
 }
+/* A size in the largest unit it fills at least once (1024 of the unit
+   below): "512 KB", "500 MB", "1.4 GB", "2.7 TB", "12.7 TB", "1.5 PB" */
+static void sizestr(mgpt_u64 sectors, DWORD ss, char*out){
+    static const char*const un[6]={"KB","MB","GB","TB","PB","EB"};
+    mgpt_u64 v=sectors; DWORD d=ss; int u=0;
+    while(d<1024u){ v>>=1; d<<=1; } while(d>1024u){ v<<=1; d>>=1; }   /* KB */
+    while(v>=(mgpt_u64)1<<20&&u<4){ v>>=10; u++; }
+    if(v<1024) wsprintfA(out,"%lu %s",u64lo(v),un[u]);
+    else if(u==0) wsprintfA(out,"%lu MB",u64lo(v>>10));
+    else wsprintfA(out,"%lu.%lu %s",u64lo(v>>10),u64lo(((v&1023)*10)>>10),un[u+1]);
+}
+/* "Disk 2", or "CD-ROM 0" for a CD / DVD drive */
+static void diskName(int dn,char*b){ if(dn&MGPT_CDROM) wsprintfA(b,"CD-ROM %d",dn&0xFF); else wsprintfA(b,"Disk %d",dn); }
+/* a size in 512-byte units as text, for one use in a format string */
+static const char*freeStr(mgpt_u64 sectors512){ static char b[24]; sizestr(sectors512,512,b); return b; }
 
-/* value + unit (0=KB,1=MB,2=GB) -> sector count for a given sector size */
+/* the size units of the dialogs: 0 KB, 1 MB, 2 GB, 3 TB, 4 PB */
+static const char*g_unitNames[5]={"KB","MB","GB","TB","PB"};
+static mgpt_u64 unitBytes(DWORD value, int unit){ return (mgpt_u64)value<<(10*(unit+1)); }
+/* value + unit -> sector count for a given sector size (a power of two) */
 static mgpt_u64 unitToSectors(DWORD value, int unit, DWORD ss){
-    DWORD ub = (unit==0)?1024u:(unit==1)?1048576u:1073741824u;
-    if(ub>=ss) return (mgpt_u64)value*(DWORD)(ub/ss);
-    return (mgpt_u64)(value/(ss/ub));
+    return unitBytes(value,unit)>>(20-mbShift(ss));
 }
 
 /* file-system kinds (mirror of GPT_FS_* in gptcore.h) */
@@ -386,16 +409,11 @@ static mgpt_u64 unitToSectors(DWORD value, int unit, DWORD ss){
 #define FS_MSR     15
 #define FS_LDMMETA 16
 #define FS_LDMDATA 17
-#define FS_KINDS   18
+#define FS_UDF     18
+#define FS_KINDS   GPT_FS_KINDS
 
-static const char* fsname(DWORD k){switch(k){
-    case FS_FAT12:return "FAT12";case FS_FAT16:return "FAT16";case FS_FAT32:return "FAT32";
-    case FS_NTFS:return "NTFS";case FS_HPFS:return "HPFS";case FS_EXFAT:return "exFAT";
-    case FS_EXT2:return "ext2";case FS_EXT3:return "ext3";case FS_EXT4:return "ext4";
-    case FS_REFS:return "ReFS";case FS_BTRFS:return "Btrfs";
-    case FS_EXT:return "Extended";case FS_EFI:return "EFI System";case FS_LINUX:return "Linux";
-    case FS_MSR:return "Reserved (MSR)";case FS_LDMMETA:return "LDM database";case FS_LDMDATA:return "LDM data";
-    default:return "RAW";}}
+static const char* const g_fsNames[GPT_FS_KINDS]=GPT_FS_NAME_LIST;
+static const char* fsname(DWORD k){ return k<GPT_FS_KINDS?g_fsNames[k]:"RAW"; }
 
 static COLORREF fscolor(DWORD k){switch(k){
     case FS_FAT12: return RGB(124,176,228);   /* light blue  */
@@ -405,6 +423,7 @@ static COLORREF fscolor(DWORD k){switch(k){
     case FS_EXFAT: return RGB(198,110,186);   /* magenta     */
     case FS_HPFS:  return RGB(72,160,156);    /* teal        */
     case FS_REFS:  return RGB(28,150,210);    /* azure       */
+    case FS_UDF:   return RGB(150,166,40);    /* olive       */
     case FS_EXT2:  return RGB(226,132,96);    /* light coral */
     case FS_EXT3:  return RGB(204,90,64);     /* coral       */
     case FS_EXT4:  return RGB(168,52,44);     /* brick       */
@@ -415,6 +434,57 @@ static COLORREF fscolor(DWORD k){switch(k){
     case FS_MSR:   return RGB(170,178,192);   /* light slate */
     case FS_LDMMETA: return RGB(84,92,108);   /* dark slate  */
     case FS_LDMDATA: return RGB(140,146,158); /* slate       */
+    /* Linux: warm reds, oranges and browns */
+    case GPT_FS_XFS:      return RGB(220,96,40);    /* orange red  */
+    case GPT_FS_JFS:      return RGB(186,120,60);   /* copper      */
+    case GPT_FS_REISERFS: return RGB(232,170,90);   /* sand        */
+    case GPT_FS_REISER4:  return RGB(200,150,70);   /* tan         */
+    case GPT_FS_F2FS:     return RGB(236,110,120);  /* salmon      */
+    case GPT_FS_NILFS2:   return RGB(190,80,110);   /* raspberry   */
+    case GPT_FS_BCACHEFS: return RGB(140,60,40);    /* rust        */
+    case GPT_FS_GFS2:     return RGB(170,100,90);   /* clay        */
+    case GPT_FS_OCFS2:    return RGB(210,140,120);  /* rose tan    */
+    case GPT_FS_SQUASHFS: return RGB(250,190,120);  /* peach       */
+    case GPT_FS_CRAMFS:   return RGB(230,200,150);  /* wheat       */
+    case GPT_FS_EROFS:    return RGB(240,160,60);   /* amber       */
+    case GPT_FS_ROMFS:    return RGB(214,180,120);  /* buff        */
+    case GPT_FS_JFFS2:    return RGB(196,110,70);   /* sienna      */
+    case GPT_FS_MINIX:    return RGB(160,120,100);  /* taupe       */
+    case GPT_FS_EXTFS:    return RGB(240,170,150);  /* pale coral  */
+    case GPT_FS_XIAFS:    return RGB(180,140,130);  /* dusty rose  */
+    /* containers and encryption: dark tones */
+    case GPT_FS_SWAP:     return RGB(96,96,110);    /* graphite    */
+    case GPT_FS_BSDSWAP:  return RGB(110,104,90);   /* dark khaki  */
+    case GPT_FS_LUKS:     return RGB(60,70,90);     /* night blue  */
+    case GPT_FS_BITLOCKER:return RGB(70,60,110);    /* deep violet */
+    case GPT_FS_CORESTOR: return RGB(80,90,100);    /* dark steel  */
+    case GPT_FS_LVM2:     return RGB(120,70,60);    /* dark brick  */
+    case GPT_FS_MDRAID:   return RGB(110,60,100);   /* plum        */
+    /* Apple: silvers and blue-greys */
+    case GPT_FS_HFS:      return RGB(170,180,190);  /* silver      */
+    case GPT_FS_HFSPLUS:  return RGB(120,140,160);  /* blue grey   */
+    case GPT_FS_HFSX:     return RGB(100,120,150);  /* slate blue  */
+    case GPT_FS_APFS:     return RGB(80,110,140);   /* steel       */
+    case GPT_FS_MFS:      return RGB(190,196,200);  /* pale silver */
+    case GPT_FS_APPLEBOOT:return RGB(150,160,170);  /* grey        */
+    /* BSD and Unix: yellows, olives and teals */
+    case GPT_FS_UFS:      return RGB(200,180,60);   /* mustard     */
+    case GPT_FS_UFS2:     return RGB(170,150,30);   /* dark gold   */
+    case GPT_FS_ZFS:      return RGB(40,120,120);   /* deep teal   */
+    case GPT_FS_HAMMER:   return RGB(120,140,60);   /* moss        */
+    case GPT_FS_HAMMER2:  return RGB(100,120,40);   /* dark moss   */
+    case GPT_FS_SYSV:     return RGB(150,150,90);   /* khaki       */
+    case GPT_FS_XENIX:    return RGB(170,170,110);  /* light khaki */
+    case GPT_FS_UNIXBFS:  return RGB(130,130,80);   /* dark khaki  */
+    case GPT_FS_EFS:      return RGB(60,150,170);   /* sea blue    */
+    case GPT_FS_VXFS:     return RGB(90,170,140);   /* jade        */
+    case GPT_FS_QNX6:     return RGB(60,140,90);    /* forest      */
+    case GPT_FS_VMFS:     return RGB(110,170,200);  /* sky         */
+    /* others */
+    case GPT_FS_ISO9660:  return RGB(220,190,40);   /* gold        */
+    case GPT_FS_BEFS:     return RGB(150,90,200);   /* purple      */
+    case GPT_FS_AMIGA:    return RGB(230,80,60);    /* tomato      */
+    case GPT_FS_BIOSBOOT: return RGB(220,120,30);   /* dark orange */
     default:       return RGB(128,133,143);   /* RAW         */
 }}
 
@@ -508,21 +578,22 @@ static DWORD pickType(MGPT_LAYOUT*l,DWORD fam,mgpt_u64 start,mgpt_u64 count){
 }
 /* one sentence saying why a partition has its type byte */
 static void typeReason(MGPT_LAYOUT*l,MGPT_PART*p,char*out,const char*v){
-    DWORD lim=u64lo(l->ChsLimit)/perMB(l->SectorSize); int beyond=pastChs(l,p->StartLba,p->SectorCount);
+    char lim[24]; int beyond=pastChs(l,p->StartLba,p->SectorCount);
+    sizestr(l->ChsLimit,l->SectorSize,lim);
     switch(p->MbrType){
     case 0x04: wsprintfA(out,"Type 04 (FAT16)%s because the partition is smaller than 32 MB.",v); break;
     case 0x06:
-        if(beyond) wsprintfA(out,"Type 06 (FAT16) is set although the partition reaches past the BIOS CHS range (the first %lu MB of this disk); 0E would be the right type.",lim);
-        else wsprintfA(out,"Type 06 (FAT16)%s because the partition is 32 MB or larger and lies inside the BIOS CHS range (the first %lu MB of this disk).",v,lim);
+        if(beyond) wsprintfA(out,"Type 06 (FAT16) is set although the partition reaches past the BIOS CHS range (the first %s of this disk); 0E would be the right type.",lim);
+        else wsprintfA(out,"Type 06 (FAT16)%s because the partition is 32 MB or larger and lies inside the BIOS CHS range (the first %s of this disk).",v,lim);
         break;
-    case 0x0E: wsprintfA(out,"Type 0E (FAT16, LBA)%s because the partition reaches past the BIOS CHS range (the first %lu MB of this disk).",v,lim); break;
-    case 0x0B: wsprintfA(out,"Type 0B (FAT32)%s because the partition lies inside the BIOS CHS range (the first %lu MB of this disk).",v,lim); break;
-    case 0x0C: wsprintfA(out,"Type 0C (FAT32, LBA)%s because the partition reaches past the BIOS CHS range (the first %lu MB of this disk).",v,lim); break;
+    case 0x0E: wsprintfA(out,"Type 0E (FAT16, LBA)%s because the partition reaches past the BIOS CHS range (the first %s of this disk).",v,lim); break;
+    case 0x0B: wsprintfA(out,"Type 0B (FAT32)%s because the partition lies inside the BIOS CHS range (the first %s of this disk).",v,lim); break;
+    case 0x0C: wsprintfA(out,"Type 0C (FAT32, LBA)%s because the partition reaches past the BIOS CHS range (the first %s of this disk).",v,lim); break;
     case 0x05:
-        if(beyond) wsprintfA(out,"Type 05 (extended) is set although the container reaches past the BIOS CHS range (the first %lu MB of this disk); 0F would be the right type.",lim);
-        else wsprintfA(out,"Type 05 (extended)%s because the container lies inside the BIOS CHS range (the first %lu MB of this disk).",v,lim);
+        if(beyond) wsprintfA(out,"Type 05 (extended) is set although the container reaches past the BIOS CHS range (the first %s of this disk); 0F would be the right type.",lim);
+        else wsprintfA(out,"Type 05 (extended)%s because the container lies inside the BIOS CHS range (the first %s of this disk).",v,lim);
         break;
-    case 0x0F: wsprintfA(out,"Type 0F (extended, LBA)%s because the container reaches past the BIOS CHS range (the first %lu MB of this disk).",v,lim); break;
+    case 0x0F: wsprintfA(out,"Type 0F (extended, LBA)%s because the container reaches past the BIOS CHS range (the first %s of this disk).",v,lim); break;
     default: wsprintfA(out,"Type %02X.",p->MbrType); break;
     }
 }
@@ -563,6 +634,8 @@ static void fixSelection(void){
 /* name a partition the way the table shows it */
 static void partLabel(MGPT_LAYOUT*l,int idx,char*b){
     int j,pr=0,lg=0; MGPT_PART*p=&l->Part[idx];
+    if(l->Media){ scopy(b,"Disc"); return; }
+    if(l->Reach&MGPT_R_WHOLE){ scopy(b,"Whole disk"); return; }
     if(p->Flags&MGPT_F_LDM){
         switch(p->LdmType){
         case MGPT_LDM_SPANNED: wsprintfA(b,"%s (part %lu of %lu)",p->VolName,p->LdmPiece+1,p->LdmPieces); break;
@@ -581,6 +654,25 @@ static void partLabel(MGPT_LAYOUT*l,int idx,char*b){
     else if(p->Flags&MGPT_F_LOGICAL) wsprintfA(b,"Logical drive %d",lg);
     else wsprintfA(b,"Partition %d",pr);
 }
+/* the disk driver below reaches only part of the disk (2 TiB limit) */
+static void reachNote(MGPT_DISKINFO*di,char*b){
+    char sz[24], t[120];
+    if(di->Reach&MGPT_R_WHOLE) scat(b,"  \xB7  one file system over the whole disk, shown only");
+    if(di->Reach&MGPT_R_EXTENDED){
+        sizestr(di->DriverSectors,di->SectorSize,sz);
+        wsprintfA(t,"  \xB7  past %s through MBRGPTNT's own 16-byte commands",sz); scat(b,t);
+    }
+    else if(di->DeviceSectors>di->TotalSectors&&di->TotalSectors){
+        char s2[24]; sizestr(di->DeviceSectors,di->SectorSize,sz); sizestr(di->TotalSectors,di->SectorSize,s2);
+        wsprintfA(t,"  \xB7  disk is %s, this Windows reaches only the first %s",sz,s2); scat(b,t);
+    }
+    else if(di->TotalSectors==0&&(di->Reach&MGPT_R_CAPPED)){
+        scat(b,"  \xB7  past the 2 TiB limit: the disk driver reports no size");
+        if(di->Reach&MGPT_R_TABLE){ sizestr(di->TableSectors,di->SectorSize,sz); wsprintfA(t," (disk is %s, read-only)",sz); scat(b,t); }
+    }
+    else if(di->Reach&MGPT_R_TABLE){ sizestr(di->TableSectors,di->SectorSize,sz); wsprintfA(t,"  \xB7  disk is %s, this Windows reaches only the first part (read-only)",sz); scat(b,t); }
+    else if(di->Reach&MGPT_R_CAPPED) scat(b,"  \xB7  2 TiB disk-driver limit: the disk may be larger");
+}
 static void partStatus(MGPT_LAYOUT*l,MGPT_PART*p,char*b){
     b[0]=0;
     if(p->Flags&MGPT_F_LDM){
@@ -592,6 +684,9 @@ static void partStatus(MGPT_LAYOUT*l,MGPT_PART*p,char*b){
         return;
     }
     if(p->FsKind==FS_MSR||p->FsKind==FS_LDMMETA||p->FsKind==FS_LDMDATA){ scopy(b,l->IsGpt?"GPT":"Primary"); sjoin(b,"Reserved"); return; }
+    if(l->Media){ scopy(b,"CD / DVD (shown only)"); return; }
+    if(l->Reach&MGPT_R_WHOLE){ scopy(b,"No partition table (shown only)"); return; }
+    if(p->Flags&MGPT_F_BEYOND) sjoin(b,"Past the reachable end, not mounted");
     if(p->Flags&MGPT_F_PROTECTED) sjoin(b,"System");
     if(p->Flags&MGPT_F_BOOT) sjoin(b,"Active");
     if(isExtType(p->MbrType)) sjoin(b,"Container");
@@ -607,40 +702,42 @@ static void partTitle(MGPT_LAYOUT*l,int idx,char*b){
 
 /* largest free area (sectors) the driver could place a new partition in;
    mirrors the gap search in gptcore (2048-sector alignment, EBR reserve) */
-static DWORD alignUp(DWORD v){return ((v+2047u)/2048u)*2048u;}
-static DWORD gapScan(MGPT_LAYOUT*l,DWORD lo,DWORD hi,int inner){
-    DWORD cur=alignUp(inner?lo+2048u:lo),best=0,i;
+static mgpt_u64 alignUp(mgpt_u64 v){return (v+2047u)&~(mgpt_u64)2047u;}
+static mgpt_u64 gapScan(MGPT_LAYOUT*l,mgpt_u64 lo,mgpt_u64 hi,int inner){
+    mgpt_u64 cur=alignUp(inner?lo+2048u:lo),best=0; DWORD i;
     while(cur<=hi){
-        DWORD next=hi+1; int inside=0;
+        mgpt_u64 next=hi+1; int inside=0;
         for(i=0;i<l->Count;i++){
-            MGPT_PART*p=&l->Part[i]; DWORD a,b;
+            MGPT_PART*p=&l->Part[i]; mgpt_u64 a,b;
             if(((p->Flags&MGPT_F_LOGICAL)?1:0)!=inner)continue;
-            a=u64lo(p->StartLba); b=a+u64lo(p->SectorCount)-1; if(inner&&a>=2048u)a-=2048u;
+            a=p->StartLba; b=a+p->SectorCount-1; if(inner&&a>=2048u)a-=2048u;
             if(cur>=a&&cur<=b){cur=alignUp(b+1+(inner?2048u:0));inside=1;break;}
         }
         if(inside)continue;
         for(i=0;i<l->Count;i++){
-            MGPT_PART*p=&l->Part[i]; DWORD a;
+            MGPT_PART*p=&l->Part[i]; mgpt_u64 a;
             if(((p->Flags&MGPT_F_LOGICAL)?1:0)!=inner)continue;
-            a=u64lo(p->StartLba); if(inner&&a>=2048u)a-=2048u;
+            a=p->StartLba; if(inner&&a>=2048u)a-=2048u;
             if(a>cur&&a<next)next=a;
         }
-        { DWORD ge=(next<=hi)?next-1:hi; if(ge>=cur&&ge-cur+1>best)best=ge-cur+1; }
+        { mgpt_u64 ge=(next<=hi)?next-1:hi; if(ge>=cur&&ge-cur+1>best)best=ge-cur+1; }
         if(next>hi)break;
         cur=alignUp(next+(inner?2048u:0));
     }
     return best;
 }
-static DWORD largestFree(MGPT_LAYOUT*l){
-    DWORD total=u64lo(l->TotalSectors), ss=l->SectorSize, es=(16384u+ss-1)/ss, first, last, best, i;
+/* MBR entries hold 32-bit sector numbers: an MBR disk is used up to
+   sector 2^32 - 1 (2 TiB with 512-byte sectors), as in the driver */
+static mgpt_u64 largestFree(MGPT_LAYOUT*l){
+    mgpt_u64 total=l->TotalSectors, first, last, best; DWORD ss=l->SectorSize, es=(16384u+ss-1)/ss, i;
     if(l->IsGpt){ if(total<2*es+8)return 0; first=2+es; last=total-2-es; }
-    else { first=2048; last=total-1; }
+    else { if(total<4096)return 0; first=2048; last=total-1; if(last>0xFFFFFFFFu)last=0xFFFFFFFFu; }
     best=gapScan(l,first,last,0);
     if(!l->IsGpt)
         for(i=0;i<l->Count;i++){
             MGPT_PART*p=&l->Part[i];
             if(!(p->Flags&MGPT_F_LOGICAL)&&isExtType(p->MbrType)){
-                DWORD es2=u64lo(p->StartLba), ee=es2+u64lo(p->SectorCount)-1, g=gapScan(l,es2,ee,1);
+                mgpt_u64 es2=p->StartLba, ee=es2+p->SectorCount-1, g=gapScan(l,es2,ee,1);
                 if(g>best)best=g;
             }
         }
@@ -664,6 +761,11 @@ static int cmdEnabled(int cmd){
         }
         return 0;
     }
+    /* a table this Windows does not reach to its end is only shown */
+    if((l->Reach&MGPT_R_TABLE)&&cmd!=CMD_LETTER&&cmd!=CMD_INIT) return 0;
+    if(l->Media) return 0;                  /* CD / DVD drives are only shown */
+    /* a whole-disk file system: only Initialize (which replaces it) */
+    if((l->Reach&MGPT_R_WHOLE)&&cmd!=CMD_INIT) return 0;
     switch(cmd){
     case CMD_NEW:     return 1;
     case CMD_DYNAMIC:
@@ -677,7 +779,7 @@ static int cmdEnabled(int cmd){
     case CMD_INIT:    return !diskIsSystem(l);
     case CMD_DELETE:  return p && !(p->Flags&MGPT_F_PROTECTED);
     case CMD_TYPE:    return p && !(p->Flags&MGPT_F_PROTECTED) && !isExtType(p->MbrType);
-    case CMD_LETTER:  return p && !(p->Flags&MGPT_F_PROTECTED) && !isExtType(p->MbrType);
+    case CMD_LETTER:  return p && !(p->Flags&(MGPT_F_PROTECTED|MGPT_F_BEYOND)) && !isExtType(p->MbrType);
     case CMD_ACTIVE:  return p && !(p->Flags&MGPT_F_PROTECTED) && !(p->Flags&MGPT_F_LOGICAL) && !isExtType(p->MbrType);
     }
     return 0;
@@ -887,8 +989,12 @@ static void drawRow(HDC dc,int r,int x,int y,int w,const int*c){
     if(pi<0){
         fillR(dc,x,y,x+w,y+18,sel?COL_SEL:COL_DISKROW);
         drawIcon(dc,IC_DISK,c[0],y+1,16,1);
-        wsprintfA(b,"Disk %d",dn); text(dc,c[0]+21,y+2,b,tc,g_fontB);
-        if(di&&isDynamic(l)){
+        diskName(dn,b); text(dc,c[0]+21,y+2,b,tc,g_fontB);
+        if(di&&di->Media){
+            if(di->TotalSectors){ sizestr(di->TotalSectors,di->SectorSize,sz); wsprintfA(b,"CD / DVD  \xB7  %s  \xB7  2048 bytes/sector  \xB7  shown only",sz); }
+            else scopy(b,"CD / DVD  \xB7  no data disc in the drive");
+            textFit(dc,c[1],y+2,x+w-c[1]-6,b,tc2,g_font);
+        } else if(di&&isDynamic(l)){
             MGPT_LDMGROUP*g=grpOf(l); char t[80];
             sizestr(di->TotalSectors,di->SectorSize,sz);
             wsprintfA(b,"Dynamic (%s)  \xB7  %s  \xB7  %lu bytes/sector",di->IsGpt?"GPT":"MBR",sz,di->SectorSize);
@@ -898,12 +1004,14 @@ static void drawRow(HDC dc,int r,int x,int y,int w,const int*c){
                 if(l->LdmMissing){ wsprintfA(t,"  \xB7  %lu disk(s) of the group missing",l->LdmMissing); scat(b,t); }
             } else scat(b,"  \xB7  its database cannot be read");
             if(diskIsSystem(l)) scat(b,"  \xB7  system disk");
+            reachNote(di,b);
             textFit(dc,c[1],y+2,x+w-c[1]-6,b,tc2,g_font);
         } else if(di){
             sizestr(di->TotalSectors,di->SectorSize,sz);
             wsprintfA(b,"%s  \xB7  %s  \xB7  %lu bytes/sector  \xB7  %s",
-                di->IsGpt?"GPT":"MBR",sz,di->SectorSize,di->Owned?"managed by MBRGPTNT":"in-box disk driver");
+                (di->Reach&MGPT_R_WHOLE)?"No partition table":di->IsGpt?"GPT":"MBR",sz,di->SectorSize,di->Owned?"managed by MBRGPTNT":"in-box disk driver");
             if(l&&diskIsSystem(l)) scat(b,"  \xB7  system disk");
+            reachNote(di,b);
             textFit(dc,c[1],y+2,x+w-c[1]-6,b,tc2,g_font);
         }
     } else if(l){
@@ -1026,9 +1134,13 @@ static void selectRow(int r){
 
 static void drawBar(HDC dc,int bx,int by,int bw,int bh,MGPT_LAYOUT*lay,int diskNo){
     RECT r; int i;
-    DWORD total=u64lo(lay->TotalSectors), spp;
+    mgpt_u64 total=lay->TotalSectors, spp;
+    /* a GPT written for a larger disk than the driver reaches: the map
+       shows the whole disk, the part out of reach hatched */
+    if(lay->TableSectors>total) total=lay->TableSectors;
+    if(lay->DeviceSectors>total) total=lay->DeviceSectors;
     if(total==0)total=1;
-    spp=total/(DWORD)bw; if(!spp)spp=1;
+    spp=udiv64(total,(mgpt_u64)bw); if(!spp)spp=1;
     fillR(dc,bx,by,bx+bw,by+bh,RGB(226,229,234));
     { HBRUSH hb=CreateHatchBrush(HS_FDIAGONAL,RGB(196,201,208)); r.left=bx;r.top=by;r.right=bx+bw;r.bottom=by+bh;
       SetBkMode(dc,TRANSPARENT); FillRect(dc,&r,hb); DeleteObject(hb); }
@@ -1036,15 +1148,16 @@ static void drawBar(HDC dc,int bx,int by,int bw,int bh,MGPT_LAYOUT*lay,int diskN
     for(i=0;i<(int)lay->Count;i++){
         MGPT_PART*p=&lay->Part[i]; int x0,x1;
         if(!isExtType(p->MbrType))continue;
-        x0=bx+(int)(u64lo(p->StartLba)/spp); x1=bx+(int)((u64lo(p->StartLba)+u64lo(p->SectorCount))/spp);
+        if(p->StartLba>=total)continue;
+        x0=bx+(int)udiv64(p->StartLba,spp); x1=bx+(int)udiv64(p->StartLba+p->SectorCount,spp);
         if(x1>bx+bw)x1=bx+bw; if(x1<=x0)x1=x0+1;
         fillR(dc,x0,by,x1,by+bh,RGB(236,238,242)); frameR(dc,x0,by,x1,by+bh,RGB(150,160,175));
         addSeg(x0,by,x1,by+bh,diskNo,i);
     }
     for(i=0;i<(int)lay->Count;i++){
         MGPT_PART*p=&lay->Part[i]; int x0,x1,in;
-        if(isExtType(p->MbrType))continue;
-        x0=bx+(int)(u64lo(p->StartLba)/spp); x1=bx+(int)((u64lo(p->StartLba)+u64lo(p->SectorCount))/spp);
+        if(isExtType(p->MbrType)||p->StartLba>=total)continue;
+        x0=bx+(int)udiv64(p->StartLba,spp); x1=bx+(int)udiv64(p->StartLba+p->SectorCount,spp);
         if(x1>bx+bw)x1=bx+bw; if(x1<=x0)x1=x0+2;
         in=(p->Flags&MGPT_F_LOGICAL)?4:0;
         fillR(dc,x0,by+in,x1,by+bh-in,fscolor(p->FsKind));
@@ -1080,6 +1193,14 @@ static void drawBar(HDC dc,int bx,int by,int bw,int bh,MGPT_LAYOUT*lay,int diskN
         }
         addSeg(x0,by+in,x1,by+bh-in,diskNo,i);
     }
+    if(lay->TableSectors>lay->TotalSectors||lay->DeviceSectors>lay->TotalSectors){
+        int xr=bx+(int)udiv64(lay->TotalSectors,spp); HBRUSH hb=CreateHatchBrush(HS_DIAGCROSS,RGB(170,40,40)); RECT q;
+        if(xr<bx+bw){
+            q.left=xr;q.top=by;q.right=bx+bw;q.bottom=by+bh; SetBkMode(dc,TRANSPARENT); FillRect(dc,&q,hb);
+            fillR(dc,xr,by,xr+2,by+bh,RGB(170,40,40));
+        }
+        DeleteObject(hb);
+    }
     frameR(dc,bx,by,bx+bw,by+bh,RGB(90,100,115));
 }
 
@@ -1093,9 +1214,12 @@ static void drawDiskMap(HDC dc,int x,int y,int w,int bottom){
         frameR(dc,x,y,x+boxw,y+bh,sel?COL_ACCENT:COL_GRID);
         if(sel) frameR(dc,x+1,y+1,x+boxw-1,y+bh-1,COL_ACCENT);
         drawIcon(dc,IC_DISK,x+6,y+4,20,1);
-        wsprintfA(b,"Disk %d",dn); text(dc,x+31,y+6,b,COL_TEXT,g_fontB);
-        sizestr(di->TotalSectors,di->SectorSize,sz);
-        if(di->Dynamic) wsprintfA(b,"Dynamic  \xB7  %s",sz); else wsprintfA(b,"%s  \xB7  %s",di->IsGpt?"GPT":"MBR",sz);
+        diskName(dn,b); text(dc,x+31,y+6,b,COL_TEXT,g_fontB);
+        { mgpt_u64 n=di->TotalSectors; if(di->TableSectors>n)n=di->TableSectors; if(di->DeviceSectors>n)n=di->DeviceSectors; sizestr(n,di->SectorSize,sz); }
+        if(di->Media) { if(di->TotalSectors) wsprintfA(b,"CD / DVD  \xB7  %s",sz); else scopy(b,"No disc"); }
+        else if(di->Dynamic) wsprintfA(b,"Dynamic  \xB7  %s",sz);
+        else if(di->Reach&MGPT_R_WHOLE) wsprintfA(b,"No table  \xB7  %s",sz);
+        else wsprintfA(b,"%s  \xB7  %s",di->IsGpt?"GPT":"MBR",sz);
         textFit(dc,x+7,y+26,boxw-10,b,COL_TEXT2,g_font);
         addSeg(x,y,x+boxw,y+bh,dn,-1);
         if(g_layOk[i]) drawBar(dc,x+boxw+6,y,w-boxw-6,bh,&g_lay[i],dn);
@@ -1115,16 +1239,20 @@ static void describeSel(char*b){
             t,ldmTypeName(p->LdmType),fsname(p->FsKind),vs,ldmStateName(p->LdmState),ds,sz);
     } else if(p){
         partTitle(l,g_selPart,t); sizestr(p->SectorCount,l->SectorSize,sz);
-        wsprintfA(b,"Disk %d  \xB7  %s  \xB7  %s  \xB7  %s",g_selDisk,t,fsname(p->FsKind),sz);
+        { char dn[24]; diskName(g_selDisk,dn); wsprintfA(b,"%s  \xB7  %s  \xB7  %s  \xB7  %s",dn,t,fsname(p->FsKind),sz); }
+    } else if(l->Media){
+        char dn[24]; diskName(g_selDisk,dn); sizestr(l->TotalSectors,l->SectorSize,sz);
+        if(l->TotalSectors) wsprintfA(b,"%s  \xB7  CD / DVD  \xB7  %s",dn,sz); else wsprintfA(b,"%s  \xB7  no data disc",dn);
     } else if(isDynamic(l)){
         MGPT_LDMGROUP*g=grpOf(l); int k=g?ldmDiskOf(g,g_selDisk):-1;
         sizestr(l->TotalSectors,l->SectorSize,sz);
-        if(g&&k>=0) wsprintfA(b,"Disk %d  \xB7  dynamic (%s)  \xB7  %s  \xB7  disk group %s (%s)  \xB7  %lu MB free",
-                              g_selDisk,l->IsGpt?"GPT":"MBR",sz,g->Name,g->Disk[k].Name,u64lo(g->Disk[k].FreeTotal)/2048);
+        if(g&&k>=0) wsprintfA(b,"Disk %d  \xB7  dynamic (%s)  \xB7  %s  \xB7  disk group %s (%s)  \xB7  %s free",
+                              g_selDisk,l->IsGpt?"GPT":"MBR",sz,g->Name,g->Disk[k].Name,freeStr(g->Disk[k].FreeTotal));
         else wsprintfA(b,"Disk %d  \xB7  dynamic (%s)  \xB7  %s",g_selDisk,l->IsGpt?"GPT":"MBR",sz);
     } else {
         sizestr(l->TotalSectors,l->SectorSize,sz);
-        wsprintfA(b,"Disk %d  \xB7  %s  \xB7  %s  \xB7  %lu MB unallocated",g_selDisk,l->IsGpt?"GPT":"MBR",sz,largestFree(l)/perMB(l->SectorSize));
+        { char fr[24]; sizestr(largestFree(l),l->SectorSize,fr);
+          wsprintfA(b,"Disk %d  \xB7  %s  \xB7  %s  \xB7  %s unallocated",g_selDisk,l->IsGpt?"GPT":"MBR",sz,fr); }
     }
 }
 
@@ -1151,12 +1279,18 @@ static void paintAll(HWND hwnd,HDC dc){
 
     /* legend: the file systems present on the disks, in a fixed order */
     {
-        static const int order[]={FS_FAT12,FS_FAT16,FS_FAT32,FS_NTFS,FS_EXFAT,FS_HPFS,FS_REFS,
-                                  FS_EXT2,FS_EXT3,FS_EXT4,FS_BTRFS,FS_LINUX,FS_EFI,FS_MSR,FS_LDMMETA,FS_LDMDATA,FS_EXT,FS_UNKNOWN};
+        static const int order[]={FS_FAT12,FS_FAT16,FS_FAT32,FS_NTFS,FS_EXFAT,FS_HPFS,FS_REFS,GPT_FS_BITLOCKER,FS_UDF,GPT_FS_ISO9660,
+            FS_EXT2,FS_EXT3,FS_EXT4,GPT_FS_EXTFS,GPT_FS_XIAFS,GPT_FS_MINIX,FS_BTRFS,GPT_FS_XFS,GPT_FS_JFS,GPT_FS_REISERFS,GPT_FS_REISER4,
+            GPT_FS_F2FS,GPT_FS_NILFS2,GPT_FS_BCACHEFS,GPT_FS_GFS2,GPT_FS_OCFS2,GPT_FS_SQUASHFS,GPT_FS_CRAMFS,GPT_FS_EROFS,GPT_FS_ROMFS,
+            GPT_FS_JFFS2,GPT_FS_SWAP,GPT_FS_LUKS,GPT_FS_LVM2,GPT_FS_MDRAID,FS_LINUX,
+            GPT_FS_HFS,GPT_FS_HFSPLUS,GPT_FS_HFSX,GPT_FS_APFS,GPT_FS_MFS,GPT_FS_CORESTOR,GPT_FS_APPLEBOOT,
+            GPT_FS_UFS,GPT_FS_UFS2,GPT_FS_ZFS,GPT_FS_HAMMER,GPT_FS_HAMMER2,GPT_FS_BSDSWAP,GPT_FS_SYSV,GPT_FS_XENIX,GPT_FS_UNIXBFS,
+            GPT_FS_EFS,GPT_FS_VXFS,GPT_FS_QNX6,GPT_FS_VMFS,GPT_FS_BEFS,GPT_FS_AMIGA,
+            FS_EFI,GPT_FS_BIOSBOOT,FS_MSR,FS_LDMMETA,FS_LDMDATA,FS_EXT,FS_UNKNOWN};
         int present[FS_KINDS], lx=8, k; DWORD i,j;
         for(k=0;k<FS_KINDS;k++)present[k]=0;
         for(i=0;i<g_dl.Count;i++) if(g_layOk[i]) for(j=0;j<g_lay[i].Count;j++){ DWORD f=g_lay[i].Part[j].FsKind; if(f<FS_KINDS)present[f]=1; }
-        for(k=0;k<FS_KINDS;k++){
+        for(k=0;k<(int)(sizeof(order)/sizeof(order[0]));k++){
             const char*nm; int tw;
             if(!present[order[k]])continue;
             nm=fsname((DWORD)order[k]); tw=textW(dc,nm,g_font);
@@ -1297,7 +1431,7 @@ static void dlgErr(const char*s){ MessageBoxA(g_dlg,s,"MBRGPTNT",MB_OK|MB_ICONEX
    pick the exact type byte (04/06/0E, 0B/0C, 05/0F) for the partition's
    size and position */
 static const char *g_newNames[] = { "FAT16", "FAT32", "NTFS", "Extended", "Linux", "EFI System" };
-static int g_ctxFreeMB;
+static mgpt_u64 g_ctxFreeMB;
 
 static void bNew(int w){
     int y=74, i;
@@ -1308,10 +1442,8 @@ static void bNew(int w){
     y+=32;
     dmk("STATIC","Size:",SS_LEFT,16,y+4,108,16,304,g_font);
     g_eSize=dmk("EDIT","",ES_AUTOHSCROLL|WS_BORDER|WS_TABSTOP,128,y,100,22,302,g_font);
-    g_cUnit=dmk("COMBOBOX","",CBS_DROPDOWN|WS_VSCROLL|WS_TABSTOP,234,y,64,80,303,g_font);
-    SendMessageA(g_cUnit,CB_ADDSTRING,0,(LPARAM)"KB");
-    SendMessageA(g_cUnit,CB_ADDSTRING,0,(LPARAM)"MB");
-    SendMessageA(g_cUnit,CB_ADDSTRING,0,(LPARAM)"GB");
+    g_cUnit=dmk("COMBOBOX","",CBS_DROPDOWN|WS_VSCROLL|WS_TABSTOP,234,y,64,124,303,g_font);
+    for(i=0;i<5;i++) SendMessageA(g_cUnit,CB_ADDSTRING,0,(LPARAM)g_unitNames[i]);
     SendMessageA(g_cUnit,CB_SETCURSEL,1,0);
     y+=28;
     g_hint=dmk("STATIC",g_hintText,SS_LEFT,128,y,w-144,30,390,g_font);
@@ -1341,7 +1473,7 @@ static int parseNewType(DWORD*out){
     *out=t; return 1;
 }
 static int vNew(void){
-    DWORD t,v=0,mb; char b[32]; int i;
+    DWORD t,v=0; mgpt_u64 mb; char b[32]; int i;
     if(!parseNewType(&t)){ dlgErr("Pick a file system from the list, or enter a partition type in hex (01 - FF)."); SetFocus(g_cType); return 0; }
     if(g_ctxGpt&&t==MGPT_TYPE_EXTENDED){ dlgErr("A GPT disk has no extended partitions. Choose a file system such as FAT16, FAT32 or NTFS."); SetFocus(g_cType); return 0; }
     GetWindowTextA(g_eSize,b,32);
@@ -1352,16 +1484,24 @@ static int vNew(void){
     if(b[i]=='K'||b[i]=='k') g_vUnit=0;
     else if(b[i]=='M'||b[i]=='m'||b[i]==0) g_vUnit=1;
     else if(b[i]=='G'||b[i]=='g') g_vUnit=2;
-    else { dlgErr("The unit must be KB, MB or GB."); SetFocus(g_cUnit); return 0; }
+    else if(b[i]=='T'||b[i]=='t') g_vUnit=3;
+    else if(b[i]=='P'||b[i]=='p') g_vUnit=4;
+    else { dlgErr("The unit must be KB, MB, GB, TB or PB."); SetFocus(g_cUnit); return 0; }
+    if(v>(DWORD)0x3FFFFF&&g_vUnit==4){ dlgErr("That size is too large."); SetFocus(g_eSize); return 0; }
     /* the partition's size in MB, for the file-system limits */
-    if(!v) mb=(DWORD)g_ctxFreeMB;
-    else mb=(g_vUnit==0)?v/1024:(g_vUnit==1)?v:v*1024;
+    if(!v) mb=g_ctxFreeMB;
+    else mb=unitBytes(v,g_vUnit)>>20;
     if(t==MGPT_TYPE_FAT16&&mb>4095){
         dlgErr(v?"A FAT16 partition can be at most 4095 MB. Enter a smaller size, or choose FAT32 or NTFS."
                 :"The free area is larger than FAT16 allows (4095 MB). Enter a size of at most 4095 MB, or choose FAT32 or NTFS.");
         SetFocus(g_eSize); return 0;
     }
     if(t==MGPT_TYPE_FAT32&&mb<33){ dlgErr("A FAT32 partition needs at least 33 MB. Enter a larger size, or choose FAT16."); SetFocus(g_eSize); return 0; }
+    if(v&&mb>g_ctxFreeMB){
+        char e[200], sz[24]; sizestr(g_ctxFreeMB<<11,512,sz);
+        wsprintfA(e,"The largest free area on this disk is %s (%lu MB). Enter a smaller size, or leave the size empty to use all of it.",sz,u64lo(g_ctxFreeMB));
+        dlgErr(e); SetFocus(g_eSize); return 0;
+    }
     g_vType=t; g_vSize=v;
     return 1;
 }
@@ -1441,13 +1581,17 @@ static int vLetter(void){
 }
 
 /* ---- Initialize ---- */
+static int g_ctxCapped;
 static void bInit(int w){
     int y=74;
     dmk("STATIC","Partition table:",SS_LEFT,16,y+2,108,16,300,g_font);
     g_radio1=dmk("BUTTON","GPT (GUID Partition Table)",BS_AUTORADIOBUTTON|WS_GROUP|WS_TABSTOP,128,y,w-144,20,321,g_font);
     g_radio2=dmk("BUTTON","MBR (Master Boot Record)",BS_AUTORADIOBUTTON,128,y+22,w-144,20,322,g_font);
     SendMessageA(g_vScheme?g_radio1:g_radio2,BM_SETCHECK,1,0);
-    g_hint=dmk("STATIC","GPT: any disk size, up to 128 partitions. MBR: up to 2 TiB and 4 primary partitions, also read by the in-box disk driver.",SS_LEFT,128,y+50,w-144,44,390,g_font);
+    g_hint=dmk("STATIC",g_ctxCapped?
+        "The disk driver of this Windows release stops at 2 TiB, and this disk did not answer the 16-byte commands MBRGPTNT uses to go further, so a GPT here would cover only 2 TiB. Initialize it with GPT on another system; its partitions in the first 2 TiB are usable here.":
+        "GPT: any disk size, up to 128 partitions. MBR: up to 2 TiB and 4 primary partitions, also read by the in-box disk driver.",SS_LEFT,128,y+50,w-144,g_ctxCapped?72:44,390,g_font);
+    if(g_ctxCapped) EnableWindow(g_radio1,0);
     g_dlgFirst=g_vScheme?g_radio1:g_radio2;
 }
 static int vInit(void){ g_vScheme=(SendMessageA(g_radio1,BM_GETCHECK,0,0)==1)?1:0; return 1; }
@@ -1471,6 +1615,10 @@ static void finish(int ok,const char*msg){
     InvalidateRect(g_main,NULL,0); UpdateWindow(g_main);
     MessageBoxA(g_main,msg,ok?"MBRGPTNT - Completed":"MBRGPTNT - Not completed",MB_OK|(ok?MB_ICONINFORMATION:MB_ICONERROR));
 }
+#define ERROR_SECTOR_NOT_FOUND 27
+static const char*reachText(void){
+    return "The disk driver of this Windows release does not reach the end of this disk - it is larger than 2 TiB (the limit with 512-byte sectors), or a partition ends in the last partial cylinder, which the NT 3.x / 4.0 disk drivers leave out. The GPT backup copy belongs there, so MBRGPTNT does not change this partition table here: it would overwrite data. Change it on a system that reaches the whole disk (for a disk past 2 TiB: Windows XP x64 or later).";
+}
 static const char*deniedText(void){
     return "The partition is in use by the running system, so it cannot be changed while Windows NT is running from it.";
 }
@@ -1485,27 +1633,30 @@ static const char*convertText(DWORD r){
     case MGPT_CVT_NOEBR: return "Cannot convert to MBR without moving data: there is no free sector in front of a partition to hold a logical drive's boot record (EBR). A gap between partitions is needed to turn them into logical drives.";
     case MGPT_CVT_EMPTY: return "Cannot read the disk's current partition table.";
     case MGPT_CVT_WRITE: return "The new partition table could not be written to the disk.";
+    case MGPT_CVT_WHOLE: return "This disk has no partition table: one file system covers the whole disk. Initialize it to give it a partition table (its data is lost).";
+    case MGPT_CVT_REACH: return "The disk driver of this Windows release does not reach the end of this disk - it is larger than 2 TiB (the limit with 512-byte sectors), or a partition ends in the last partial cylinder, which the NT 3.x / 4.0 disk drivers leave out. The GPT backup copy belongs there, so MBRGPTNT does not change this partition table here: it would overwrite data. Change it on a system that reaches the whole disk (for a disk past 2 TiB: Windows XP x64 or later).";
     default: return "The conversion could not be completed.";
     }
 }
 
 static void cmdNew(void){
     static mgpt_u64 old[MGPT_MAX_PARTS]; static char msg[900]; static char why[320];
-    MGPT_LAYOUT*l=layOf(g_selDisk); MGPT_DISKINFO*di; MGPT_CREATE c; DWORD n,i,k,ret,freeS,pm; char sub[160], sz[24], t[64];
+    MGPT_LAYOUT*l=layOf(g_selDisk); MGPT_DISKINFO*di; MGPT_CREATE c; DWORD n,i,k,ret,freeMB; mgpt_u64 freeS; char sub[160], sz[24], t[64];
     if(!l)return;
-    pm=perMB(l->SectorSize); freeS=largestFree(l);
+    freeS=largestFree(l); freeMB=u64lo(toMB(freeS,l->SectorSize));
     if(freeS==0){ MessageBoxA(g_main,"There is no unallocated space on this disk for a new partition.","MBRGPTNT",MB_OK|MB_ICONINFORMATION); return; }
     g_ctxGpt=l->IsGpt; g_ctxLogical=0;
-    g_ctxFreeMB=(int)(freeS/pm);
-    wsprintfA(g_hintText,"Empty size = the largest free area (%lu MB). FAT16 holds up to 4095 MB, FAT32 needs 33 MB or more.",freeS/pm);
-    wsprintfA(sub,"Disk %d  \xB7  %s  \xB7  %lu MB unallocated",g_selDisk,l->IsGpt?"GPT":"MBR",freeS/pm);
+    g_ctxFreeMB=toMB(freeS,l->SectorSize);
+    sizestr(freeS,l->SectorSize,sz); (void)freeMB;
+    wsprintfA(g_hintText,"Empty size = the largest free area (%s). FAT16 holds up to 4095 MB, FAT32 needs 33 MB or more.",sz);
+    wsprintfA(sub,"Disk %d  \xB7  %s  \xB7  %s unallocated",g_selDisk,l->IsGpt?"GPT":"MBR",sz);
     if(!runDialog(IC_NEW,"Create partition",sub,"~A new partition table will be written to the disk.","Create",390,242,bNew,vNew))return;
     n=l->Count; for(i=0;i<n;i++) old[i]=l->Part[i].StartLba;
     c.DiskNumber=(DWORD)g_selDisk; c.MbrType=g_vType; c.StartLba=0; c.Boot=0;
     c.SectorCount=g_vSize?unitToSectors(g_vSize,g_vUnit,l->SectorSize):0;
     busy("Creating the partition, please wait...");
     if(!DeviceIoControl(g_drv,IOCTL_MGPT_CREATE,&c,sizeof(c),NULL,0,&ret,NULL)){
-        finish(0,GetLastError()==ERROR_ACCESS_DENIED?deniedText():
+        finish(0,GetLastError()==ERROR_SECTOR_NOT_FOUND?reachText():GetLastError()==ERROR_ACCESS_DENIED?deniedText():
             "The partition could not be created. Check that the size fits in the free space. An MBR disk holds at most 4 primary partitions (the extended partition counts as one) and only one extended partition; once the 4 entries are used, new partitions can only go inside the extended partition as logical drives.");
         return;
     }
@@ -1540,8 +1691,8 @@ static void cmdDelete(void){
     static char msg[300]; MGPT_LAYOUT*l=layOf(g_selDisk); MGPT_PART*p=selPart(); MGPT_DELETE d; DWORD ret,i,oldL; char t[48], sub[160], sz[24];
     if(!l||!p)return;
     if(isExtType(p->MbrType)){
-        DWORD es=u64lo(p->StartLba), ee=es+u64lo(p->SectorCount);
-        for(i=0;i<l->Count;i++) if((l->Part[i].Flags&MGPT_F_LOGICAL)&&u64lo(l->Part[i].StartLba)>=es&&u64lo(l->Part[i].StartLba)<ee){
+        mgpt_u64 es=p->StartLba, ee=es+p->SectorCount;
+        for(i=0;i<l->Count;i++) if((l->Part[i].Flags&MGPT_F_LOGICAL)&&l->Part[i].StartLba>=es&&l->Part[i].StartLba<ee){
             MessageBoxA(g_main,"This extended partition still contains logical drives. Delete the logical drives inside it first.","MBRGPTNT",MB_OK|MB_ICONEXCLAMATION);
             return;
         }
@@ -1558,7 +1709,7 @@ static void cmdDelete(void){
         if(oldL&&(GetLogicalDrives()&(1UL<<(oldL-'A')))){ char x[120]; wsprintfA(x,"\n\nDrive %c: was in use, so it stays available until the next restart.",(char)oldL); scat(msg,x); }
         g_selPart=-1;
         finish(1,msg);
-    } else finish(0,GetLastError()==ERROR_ACCESS_DENIED?deniedText():
+    } else finish(0,GetLastError()==ERROR_SECTOR_NOT_FOUND?reachText():GetLastError()==ERROR_ACCESS_DENIED?deniedText():
                   GetLastError()==145?"This extended partition still contains logical drives. Delete the logical drives inside it first.":
                   "The partition could not be deleted.");
 }
@@ -1579,7 +1730,7 @@ static void cmdActive(void){
     if(DeviceIoControl(g_drv,IOCTL_MGPT_SETACTIVE,&s,sizeof(s),NULL,0,&ret,NULL)){
         wsprintfA(msg,isAct?"%s is no longer active.":"%s is now the active partition.",t);
         finish(1,msg);
-    } else finish(0,GetLastError()==ERROR_ACCESS_DENIED?deniedText():"The active flag could not be changed.");
+    } else finish(0,GetLastError()==ERROR_SECTOR_NOT_FOUND?reachText():GetLastError()==ERROR_ACCESS_DENIED?deniedText():"The active flag could not be changed.");
 }
 
 static void cmdType(void){
@@ -1597,7 +1748,7 @@ static void cmdType(void){
         wsprintfA(msg,"The type of %s was changed from %02X to %02X.",t,g_ctxCurType,g_vType);
         if(l->IsGpt) scat(msg,"\n\nOn a GPT disk this sets the partition's type GUID; the manager keeps showing the file system it finds on the volume.");
         finish(1,msg);
-    } else finish(0,GetLastError()==ERROR_ACCESS_DENIED?deniedText():"The partition type could not be changed.");
+    } else finish(0,GetLastError()==ERROR_SECTOR_NOT_FOUND?reachText():GetLastError()==ERROR_ACCESS_DENIED?deniedText():"The partition type could not be changed.");
 }
 
 static void cmdLetter(void){
@@ -1653,15 +1804,17 @@ static void cmdInit(void){
     sizestr(l->TotalSectors,l->SectorSize,sz);
     wsprintfA(sub,"Disk %d  \xB7  %s  \xB7  currently %s with %lu partition(s)",g_selDisk,sz,l->IsGpt?"GPT":"MBR",l->Count);
     wsprintfA(wr,"All partitions and data on Disk %d will be erased.",g_selDisk);
-    g_vScheme=1;
-    if(!runDialog(IC_INIT,"Initialize disk",sub,wr,"Initialize",400,246,bInit,vInit))return;
+    g_ctxCapped=(l->Reach&MGPT_R_CAPPED)?1:0;
+    g_vScheme=g_ctxCapped?0:1;
+    if(!runDialog(IC_INIT,"Initialize disk",sub,wr,"Initialize",400,g_ctxCapped?274:246,bInit,vInit))return;
     in.DiskNumber=(DWORD)g_selDisk; in.Scheme=g_vScheme;
     busy("Initializing the disk, please wait...");
     if(DeviceIoControl(g_drv,IOCTL_MGPT_INIT,&in,sizeof(in),NULL,0,&ret,NULL)){
         wsprintfA(msg,"Disk %d was initialized as an empty %s disk.\n\nCreate partitions on it with New.",g_selDisk,g_vScheme?"GPT":"MBR");
         g_selPart=-1;
         finish(1,msg);
-    } else finish(0,GetLastError()==ERROR_ACCESS_DENIED?"This disk holds the running system, so it cannot be initialized.":"The disk could not be initialized.");
+    } else finish(0,GetLastError()==ERROR_SECTOR_NOT_FOUND?"The disk driver of this Windows release reaches only the first 2 TiB of this disk (or reports no size at all); the disk is larger. A GPT is not written here: its backup copy would land in the middle of the disk. Initialize it with GPT on a system that reaches the whole disk (Windows XP x64 or later), or choose MBR.":
+                  GetLastError()==ERROR_ACCESS_DENIED?"This disk holds the running system, so it cannot be initialized.":"The disk could not be initialized.");
 }
 
 
@@ -1683,6 +1836,7 @@ static const char*ldmReasonText(DWORD r){
     case MGPT_LDMR_NOTEMPTY: return "The disk still holds dynamic volumes. Delete them first.";
     case MGPT_LDMR_SAME:     return "The disk is already of that kind.";
     case MGPT_LDMR_FOREIGN:  return "Another disk group (managed by Windows) is present. MBRGPTNT keeps one disk group of its own.";
+    case MGPT_LDMR_REACH:    return "A disk of this group is larger than the disk driver of this Windows release can address (2 TiB with 512-byte sectors), so the group is not changed here. Volume pieces past that point are treated as missing.";
     }
     return "The operation could not be completed.";
 }
@@ -1719,7 +1873,7 @@ static void bVol(int w){
 }
 
 static int vVol(void){
-    char b[48]; int i; DWORD v=0, n=0, k, t=0; mgpt_u64 sum=0, rem; DWORD want, per, minFree=0;
+    char b[48]; int i; DWORD v=0, n=0, k, t=0; mgpt_u64 sum=0, rem, want, per, minFree=0;
     GetWindowTextA(g_cType,b,48);
     for(i=0;i<5;i++) if(startsWith(b,g_volTypes[i])) t=(DWORD)(i+1);
     if(!t){ dlgErr("Pick a volume type from the list."); SetFocus(g_cType); return 0; }
@@ -1730,10 +1884,10 @@ static int vVol(void){
         MGPT_LDMDISK*d=&g_ctxGrp->Disk[g_cDiskIdx[i]];
         if(d->FreeLargest==0){ wsprintfA(b,"Disk %lu has no free space.",d->NtDisk); dlgErr(b); return 0; }
         g_vDisk[n]=(DWORD)g_cDiskIdx[i]; g_vSz[n]=d->FreeLargest;
-        if(!n||u64lo(d->FreeLargest)<minFree) minFree=u64lo(d->FreeLargest);
+        if(!n||d->FreeLargest<minFree) minFree=d->FreeLargest;
         sum+=d->FreeLargest; n++;
     }
-    want=v*2048;
+    want=(mgpt_u64)v*2048;
     switch(t){
     case MGPT_LDM_SIMPLE:
         if(n!=1){ dlgErr("A simple volume uses exactly one disk. Tick one disk."); return 0; }
@@ -1754,8 +1908,8 @@ static int vVol(void){
         if(t==MGPT_LDM_STRIPED&&n<2){ dlgErr("A striped volume uses two or more disks. Tick at least two disks."); return 0; }
         if(t==MGPT_LDM_MIRROR&&n!=2){ dlgErr("A mirrored volume uses exactly two disks. Tick two disks."); return 0; }
         if(t==MGPT_LDM_RAID5&&n<3){ dlgErr("A RAID-5 volume uses three or more disks. Tick at least three disks."); return 0; }
-        per=want?(want+cols-1)/cols:minFree;
-        if(t!=MGPT_LDM_MIRROR) per=want?((per+127)/128)*128:(per/128)*128;
+        per=want?udiv64(want+cols-1,cols):minFree;
+        if(t!=MGPT_LDM_MIRROR) per=want?((per+127)&~(mgpt_u64)127):(per&~(mgpt_u64)127);
         if(per==0||per>minFree){ dlgErr("The size is larger than the free space allows: each disk needs an equal part, and the smallest free area limits it."); SetFocus(g_eSize); return 0; }
         for(k=0;k<n;k++) g_vSz[k]=per;
         break; }

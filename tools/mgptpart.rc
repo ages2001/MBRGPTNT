@@ -1,0 +1,5 @@
+1 ICON "mgptcon.ico"
+#define MG_DESC "MBRGPTNT command-line partition tool"
+#define MG_NAME "mgptpart.exe"
+#define MG_TYPE 1
+#include "../src/mgptver.rc"

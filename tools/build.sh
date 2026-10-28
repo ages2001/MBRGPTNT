@@ -22,8 +22,9 @@ build_x64() {
     for s in $und; do echo "$prov" | grep -qx "$s" && continue; echo "$s" >> "$def"; done
     llvm-dlltool -m i386:x86-64 -d "$def" -l "$out/ntoskrnl.lib"
     echo "[*] x64: linking"
+    llvm-rc /nologo /fo "$out/mgptver.res" "$SRC/mgptver.rc"
     lld-link /nologo /driver /subsystem:native,5.02 /entry:DriverEntry /base:0x10000 /nodefaultlib \
-        /out:"$out/mbrgptnt.sys" "$out/gptcore.obj" "$out/ldmcore.obj" "$out/mgptdrv.obj" "$out/ntoskrnl.lib"
+        /out:"$out/mbrgptnt.sys" "$out/gptcore.obj" "$out/ldmcore.obj" "$out/mgptdrv.obj" "$out/mgptver.res" "$out/ntoskrnl.lib"
     python3 - "$out/mbrgptnt.sys" <<'PY'
 import sys, pefile
 p = pefile.PE(sys.argv[1]); p.OPTIONAL_HEADER.CheckSum = p.generate_checksum(); p.write(sys.argv[1])
@@ -53,8 +54,9 @@ build_one() {
     for s in $und; do echo "$prov" | grep -qx "$s" && continue; echo "${s#_}" >> "$def"; done
     llvm-dlltool -m i386 --kill-at -d "$def" -l "$out/ntoskrnl.lib"
     echo "[*] $target: linking"
+    llvm-rc /nologo /fo "$out/mgptver.res" "$SRC/mgptver.rc"
     lld-link /nologo /driver /subsystem:$subver /entry:DriverEntry@8 /base:0x10000 /nodefaultlib \
-        /out:"$out/mbrgptnt.sys" "$out/gptcore.obj" "$out/ldmcore.obj" "$out/mgptdrv.obj" "$out/ntoskrnl.lib"
+        /out:"$out/mbrgptnt.sys" "$out/gptcore.obj" "$out/ldmcore.obj" "$out/mgptdrv.obj" "$out/mgptver.res" "$out/ntoskrnl.lib"
     python3 - "$out/mbrgptnt.sys" <<'PY'
 import sys, pefile
 p = pefile.PE(sys.argv[1]); p.OPTIONAL_HEADER.CheckSum = p.generate_checksum(); p.write(sys.argv[1])

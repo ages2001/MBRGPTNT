@@ -38,7 +38,8 @@
 #define IOCTL_MGPT_LDMLETTER CTL_CODE(MGPT_DEVTYPE, 0x80F, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_MGPT_DYNAMIC   CTL_CODE(MGPT_DEVTYPE, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-#define MGPT_MAX_DISKS      16
+#define MGPT_MAX_DISKS      24   /* hard disks and CD / DVD drives */
+#define MGPT_CDROM        0x100  /* DiskNumber of CD / DVD drive n: MGPT_CDROM | n */
 #define MGPT_MAX_PARTS     128
 
 #define MGPT_F_BOOT        0x01
@@ -47,6 +48,19 @@
 #define MGPT_F_GPTENTRY    0x08
 #define MGPT_F_PROTECTED   0x10   /* running system/boot partition - cannot change */
 #define MGPT_F_LDM         0x20   /* an extent of a dynamic volume (see LdmVol) */
+#define MGPT_F_BEYOND      0x40   /* reaches past the end the disk driver reaches */
+
+/* MGPT_DISKINFO.Reach / MGPT_LAYOUT.Reach: the disk driver below sees only
+   part of the disk (a disk past 2 TiB behind 32-bit sector numbers) */
+#define MGPT_R_TABLE       0x01   /* the GPT was written for a larger disk */
+#define MGPT_R_CAPPED      0x02   /* the driver's 2 TiB limit: 2^32 or 2^32 - 1
+                                     sectors (or none) reported, or the device
+                                     says it is larger (DeviceSectors) */
+#define MGPT_R_PARTS       0x04   /* partitions reach past the reachable end */
+#define MGPT_R_EXTENDED    0x08   /* the disk driver reaches only DriverSectors;
+                                     MBRGPTNT reaches the rest itself */
+#define MGPT_R_WHOLE       0x10   /* no partition table: one file system over
+                                     the whole disk (Part[0]); only shown */
 
 /* dynamic volume layouts and states */
 #define MGPT_LDM_SIMPLE    1
@@ -74,6 +88,7 @@
 #define MGPT_LDMR_NOTEMPTY  12        /* disk still holds volumes */
 #define MGPT_LDMR_SAME      13        /* already dynamic / basic */
 #define MGPT_LDMR_FOREIGN   14        /* another disk group is already present */
+#define MGPT_LDMR_REACH     15        /* the disk driver does not reach the whole disk */
 
 /* MGPT_CREATE.MbrType values above 0xFF: let the driver pick the exact
    type byte from the partition's size and position (see GptPickType) */
@@ -92,6 +107,8 @@
 #define MGPT_CVT_EMPTY       7
 #define MGPT_CVT_WRITE       8
 #define MGPT_CVT_DYNAMIC     9   /* dynamic disk: convert to basic first */
+#define MGPT_CVT_REACH      10   /* the disk driver does not reach the whole disk */
+#define MGPT_CVT_WHOLE      11   /* no partition table (whole-disk file system) */
 
 #if defined(_MSC_VER)
 typedef unsigned __int64 mgpt_u64;
@@ -132,6 +149,12 @@ typedef struct _MGPT_LAYOUT {
     mgpt_u64      PubSize;
     char          DgName[32];
     MGPT_PART     Part[MGPT_MAX_PARTS];
+    mgpt_u64      TableSectors;  /* GPT: disk size the table was written for */
+    unsigned long Reach;         /* MGPT_R_* */
+    mgpt_u64      DeviceSectors; /* the device's real size, when larger than
+                                    TotalSectors and known; else 0 */
+    mgpt_u64      DriverSectors; /* MGPT_R_EXTENDED: what the disk driver reaches */
+    unsigned long Media;         /* 0 hard disk, 1 CD / DVD drive (shown only) */
 } MGPT_LAYOUT;
 
 typedef struct _MGPT_DISKINFO {
@@ -142,6 +165,12 @@ typedef struct _MGPT_DISKINFO {
     unsigned long PartCount;
     unsigned long Owned;
     unsigned long Dynamic;
+    mgpt_u64      TableSectors;  /* GPT: disk size the table was written for */
+    unsigned long Reach;         /* MGPT_R_* */
+    mgpt_u64      DeviceSectors; /* the device's real size, when larger than
+                                    TotalSectors and known; else 0 */
+    mgpt_u64      DriverSectors; /* MGPT_R_EXTENDED: what the disk driver reaches */
+    unsigned long Media;         /* 0 hard disk, 1 CD / DVD drive (shown only) */
 } MGPT_DISKINFO;
 
 typedef struct _MGPT_DISKLIST {

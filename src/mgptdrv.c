@@ -37,12 +37,15 @@ typedef struct _PART_EXT {
                                          new opens and I/O refused until the
                                          device can be deleted */
     struct _LDMRT    *Ldm;            /* a dynamic (LDM) volume: its layout */
+    gpt_u64           BigFrom;        /* nonzero: disk byte offset where the
+                                         disk driver's reach ends; requests
+                                         past it go through BigIo */
     char              DevName[40];    /* \Device\... name */
 } PART_EXT, *PPART_EXT;
 
 typedef struct _CTRL_EXT { ULONG Kind; } CTRL_EXT, *PCTRL_EXT;
 
-typedef struct _ENUMCTX { PDEVICE_OBJECT Part0; ULONG BytesPerSector; gpt_u64 Limit; } ENUMCTX;
+typedef struct _ENUMCTX { PDEVICE_OBJECT Part0; ULONG BytesPerSector; gpt_u64 Limit; gpt_u64 BigFrom; } ENUMCTX;
 
 static PDRIVER_OBJECT g_Driver;
 static PDEVICE_OBJECT g_Control;
@@ -99,9 +102,64 @@ static NTSTATUS SyncIoctl(ULONG Code, PDEVICE_OBJECT Device, PVOID In, ULONG InL
     return st;
 }
 
+/* ---- past 2 TiB on releases whose disk driver stops there ----------
+   NT 3.x - XP i386 read and write disks with READ(10) / WRITE(10), whose
+   32-bit sector numbers end at 2 TiB (with 512-byte sectors). The device
+   itself can do more: MBRGPTNT sends READ(16) / WRITE(16) for the part
+   past that through the disk driver's SCSI pass-through
+   (IOCTL_SCSI_PASS_THROUGH_DIRECT, from NT 3.5 on), which the controller
+   driver (AHCINT, a SCSI card) carries out like any other request. Used
+   only when the device answered READ CAPACITY(16) with a larger size and
+   its last sector could be read this way. */
+#define IOCTL_SCSI_PASS_THROUGH_DIRECT_ 0x0004D014UL
+typedef struct _MG_SPTD {
+    USHORT Length;
+    UCHAR  ScsiStatus, PathId, TargetId, Lun, CdbLength, SenseInfoLength, DataIn;
+    ULONG  DataTransferLength, TimeOutValue;
+    PVOID  DataBuffer;
+    ULONG  SenseInfoOffset;
+    UCHAR  Cdb[16];
+} MG_SPTD;
+typedef struct _MG_SPTDBUF { MG_SPTD S; ULONG Fill; UCHAR Sense[32]; } MG_SPTDBUF;
+#define BIG_CHUNK 65536u   /* bytes per command: within what every controller driver takes */
+
+static NTSTATUS SyncIoctl(ULONG Code, PDEVICE_OBJECT Device, PVOID In, ULONG InLen, PVOID Out, ULONG OutLen);
+
+/* Only from a thread at PASSIVE_LEVEL (the pass-through path of some port
+   drivers waits on IRPs of its own); the read / write path hands its
+   requests to the BigThread for this. Buf must be nonpaged or locked. */
+static NTSTATUS BigIo(PDEVICE_OBJECT part0, int write, gpt_u64 lba, ULONG bytes, UCHAR *buf, ULONG bps)
+{
+    MG_SPTDBUF *b = (MG_SPTDBUF *)ExAllocatePool(NonPagedPool, sizeof(MG_SPTDBUF));
+    NTSTATUS st = STATUS_SUCCESS; int i, tries;
+    if (!b) return STATUS_INSUFFICIENT_RESOURCES;
+    while (bytes) {
+        ULONG n = bytes > BIG_CHUNK ? BIG_CHUNK : bytes, cnt = n / bps;
+        for (tries = 0; tries < 3; tries++) {
+            memset(b, 0, sizeof(*b));
+            b->S.Length = sizeof(MG_SPTD); b->S.CdbLength = 16; b->S.SenseInfoLength = sizeof(b->Sense);
+            b->S.DataIn = (UCHAR)(write ? 0 : 1);   /* SCSI_IOCTL_DATA_OUT / _IN */
+            b->S.DataTransferLength = n; b->S.TimeOutValue = 60; b->S.DataBuffer = buf;
+            b->S.SenseInfoOffset = (ULONG)((UCHAR *)b->Sense - (UCHAR *)b);
+            b->S.Cdb[0] = (UCHAR)(write ? 0x8A : 0x88);            /* WRITE(16) / READ(16) */
+            for (i = 0; i < 8; i++) b->S.Cdb[2 + i] = (UCHAR)(lba >> (8 * (7 - i)));
+            for (i = 0; i < 4; i++) b->S.Cdb[10 + i] = (UCHAR)(cnt >> (8 * (3 - i)));
+            st = SyncIoctl(IOCTL_SCSI_PASS_THROUGH_DIRECT_, part0, b, sizeof(*b), b, sizeof(*b));
+            if (NT_SUCCESS(st) && b->S.ScsiStatus == 0) break;
+            if (NT_SUCCESS(st)) st = (NTSTATUS)0xC0000185L;   /* STATUS_IO_DEVICE_ERROR */
+        }
+        if (!NT_SUCCESS(st)) break;
+        lba += cnt; buf += n; bytes -= n;
+    }
+    ExFreePool(b);
+    return st;
+}
+
 static int EnumRead(void *Ctx, gpt_u64 Lba, gpt_u32 Count, void *Buf)
 {
     ENUMCTX *e = (ENUMCTX *)Ctx; LARGE_INTEGER off; NTSTATUS st;
+    if (e->BigFrom && Lba + Count > e->BigFrom)
+        return NT_SUCCESS(BigIo(e->Part0, 0, Lba, Count * e->BytesPerSector, (UCHAR *)Buf, e->BytesPerSector)) ? 0 : 1;
     off.QuadPart = (gpt_u64)Lba * (gpt_u64)e->BytesPerSector;
     st = SyncTransfer(IRP_MJ_READ, e->Part0, Buf, Count * e->BytesPerSector, &off);
     if (!NT_SUCCESS(st)) { D("read fail lba="); DH((ULONG)Lba); D(" n="); DH(Count); D(" st="); DH(st); D(" buf="); DH((ULONG_PTR)Buf); D("\n"); }
@@ -114,6 +172,8 @@ static int EnumWrite(void *Ctx, gpt_u64 Lba, gpt_u32 Count, const void *Buf)
        partial cylinder on NT 3.x / 4.0) cannot be reached: the copies
        inside it are written */
     if (e->Limit) { if (Lba >= e->Limit) return 0; if (Lba + Count > e->Limit) Count = (gpt_u32)(e->Limit - Lba); }
+    if (e->BigFrom && Lba + Count > e->BigFrom)
+        return NT_SUCCESS(BigIo(e->Part0, 1, Lba, Count * e->BytesPerSector, (UCHAR *)Buf, e->BytesPerSector)) ? 0 : 1;
     off.QuadPart = (gpt_u64)Lba * (gpt_u64)e->BytesPerSector;
     return NT_SUCCESS(SyncTransfer(IRP_MJ_WRITE, e->Part0, (PVOID)Buf, Count * e->BytesPerSector, &off)) ? 0 : 1;
 }
@@ -159,6 +219,54 @@ static NTSTATUS NTAPI DispCreateClose(PDEVICE_OBJECT Dev, PIRP Irp)
 static NTSTATUS LdmReadWrite(PPART_EXT ext, PIRP Irp);
 static NTSTATUS LdmDeviceControl(PPART_EXT ext, PIRP Irp, ULONG code, PVOID sys, ULONG inlen, ULONG outlen);
 
+/* Requests past the disk driver's reach: queued to the BigThread, which
+   runs at PASSIVE_LEVEL (paging I/O arrives at APC level, where the
+   pass-through could not wait for IRPs of its own) */
+static PIRP   g_bigHead, g_bigTail;
+static KEVENT g_bigLock, g_bigWake;
+static int    g_bigThread;
+#define SL_PENDING_RETURNED_ 0x01
+static NTSTATUS BigQueue(PIRP Irp)
+{
+    if (!g_bigThread) return Complete(Irp, (NTSTATUS)0xC0000185L, 0);
+    IoGetCurrentIrpStackLocation(Irp)->Control |= SL_PENDING_RETURNED_;   /* IoMarkIrpPending */
+    KeWaitForSingleObject(&g_bigLock, Executive, KernelMode, FALSE, NULL);
+    Irp->Tail.Overlay.ListEntry.Flink = NULL;
+    if (g_bigTail) g_bigTail->Tail.Overlay.ListEntry.Flink = (PLIST_ENTRY)Irp; else g_bigHead = Irp;
+    g_bigTail = Irp;
+    KeSetEvent(&g_bigLock, 0, FALSE);
+    KeSetEvent(&g_bigWake, 0, FALSE);
+    return STATUS_PENDING;
+}
+static VOID NTAPI BigThread(PVOID ctx)
+{
+    (void)ctx;
+    for (;;) {
+        PIRP irp;
+        KeWaitForSingleObject(&g_bigWake, Executive, KernelMode, FALSE, NULL);
+        for (;;) {
+            PIO_STACK_LOCATION cur; PPART_EXT ext; UCHAR *buf; NTSTATUS st; ULONG len; gpt_u64 abs;
+            KeWaitForSingleObject(&g_bigLock, Executive, KernelMode, FALSE, NULL);
+            irp = g_bigHead;
+            if (irp) { g_bigHead = (PIRP)irp->Tail.Overlay.ListEntry.Flink; if (!g_bigHead) g_bigTail = NULL; }
+            KeSetEvent(&g_bigLock, 0, FALSE);
+            if (!irp) break;
+            cur = IoGetCurrentIrpStackLocation(irp);
+            ext = (PPART_EXT)cur->DeviceObject->DeviceExtension;
+            len = cur->Parameters.ReadWrite.Length;
+            abs = (gpt_u64)ext->StartingOffset.QuadPart + (gpt_u64)cur->Parameters.ReadWrite.ByteOffset.QuadPart;
+            buf = irp->MdlAddress ? (UCHAR *)MmGetSystemAddress(irp->MdlAddress) : NULL;
+            { int sh = 0; while (sh < 16 && (1UL << sh) < ext->BytesPerSector) sh++;
+            if (ext->Gone) st = STATUS_NO_SUCH_DEVICE;
+            else if (!buf) st = STATUS_INSUFFICIENT_RESOURCES;
+            else if (((ULONG)abs | len) & (ext->BytesPerSector - 1)) st = STATUS_INVALID_PARAMETER;
+            else st = BigIo(ext->LowerDevice, cur->MajorFunction == IRP_MJ_WRITE, abs >> sh, len, buf, ext->BytesPerSector); }
+            irp->IoStatus.Status = st; irp->IoStatus.Information = NT_SUCCESS(st) ? len : 0;
+            IoCompleteRequest(irp, IO_NO_INCREMENT);
+        }
+    }
+}
+
 static NTSTATUS NTAPI DispReadWrite(PDEVICE_OBJECT Dev, PIRP Irp)
 {
     PPART_EXT ext = (PPART_EXT)Dev->DeviceExtension;
@@ -176,6 +284,8 @@ static NTSTATUS NTAPI DispReadWrite(PDEVICE_OBJECT Dev, PIRP Irp)
         return Complete(Irp, STATUS_INVALID_PARAMETER, 0);
     }
     if (len == 0) return Complete(Irp, STATUS_SUCCESS, 0);
+    if (ext->BigFrom && (gpt_u64)ext->StartingOffset.QuadPart + (gpt_u64)end.QuadPart > ext->BigFrom)
+        return BigQueue(Irp);
     CopyStackDown(nxt, cur, ext->LowerDevice);
     nxt->Parameters.ReadWrite.ByteOffset.QuadPart = off.QuadPart + ext->StartingOffset.QuadPart;
     return IoCallDriver(ext->LowerDevice, Irp);
@@ -183,6 +293,65 @@ static NTSTATUS NTAPI DispReadWrite(PDEVICE_OBJECT Dev, PIRP Irp)
 
 static NTSTATUS ControlIoctl(PIRP Irp, ULONG Code, PVOID Sys, ULONG InLen, ULONG OutLen);
 static NTSTATUS SetVolumeType(PPART_EXT ext, UCHAR type);
+static NTSTATUS LdmSetType(struct _LDMRT *rt, UCHAR type);
+
+/* The size and position requests that Windows 2000 / XP added. They must be
+   answered for the volume itself: passed down, the disk answers them for
+   the whole disk, and a file system reading the volume size from them
+   (GET_LENGTH_INFO, GET_PARTITION_INFO_EX) would look for its end-of-volume
+   structures (UDF's last anchor, a backup boot sector) past the volume.
+   Partitions are reported in the MBR style, with the type byte that
+   GET_PARTITION_INFO gives. Returns -1 for any other request. */
+#define IOCTL_DISK_GET_LENGTH_INFO       0x0007405CUL
+#define IOCTL_DISK_GET_PARTITION_INFO_EX 0x00070048UL
+#define IOCTL_DISK_SET_PARTITION_INFO_EX 0x0007C04CUL
+#define IOCTL_STORAGE_GET_DEVICE_NUMBER  0x002D1080UL
+static NTSTATUS VolumeIoctlEx(PPART_EXT ext, PIRP Irp, ULONG code, PVOID sys, ULONG inlen, ULONG outlen,
+                              gpt_u64 startOff, int *handled)
+{
+    UCHAR *b = (UCHAR *)sys; ULONG i;
+    *handled = 1;
+    switch (code) {
+    case IOCTL_DISK_GET_LENGTH_INFO:
+        if (outlen < 8) return Complete(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+        *(LONGLONG *)b = ext->PartitionLength.QuadPart;
+        return Complete(Irp, STATUS_SUCCESS, 8);
+    case IOCTL_DISK_GET_PARTITION_INFO_EX:
+        /* PARTITION_INFORMATION_EX: style @0, StartingOffset @8,
+           PartitionLength @16, PartitionNumber @24, RewritePartition @28,
+           MBR part @32: type, boot, recognized, hidden sectors @36 */
+        if (outlen < 144) return Complete(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+        for (i = 0; i < 144; i++) b[i] = 0;
+        *(LONGLONG *)(b + 8) = (LONGLONG)startOff;
+        *(LONGLONG *)(b + 16) = ext->PartitionLength.QuadPart;
+        *(ULONG *)(b + 24) = ext->PartitionNumber;
+        b[32] = (ext->PartitionType == 0x0E) ? 0x06 : ext->PartitionType;
+        b[33] = ext->Ldm ? 0 : (ext->BootIndicator ? 1 : 0);
+        b[34] = (ext->Ldm || ext->Recognized) ? 1 : 0;
+        *(ULONG *)(b + 36) = ext->Ldm ? (ULONG)(startOff >> 9) : ext->StartLbaLow;
+        return Complete(Irp, STATUS_SUCCESS, 144);
+    case IOCTL_DISK_SET_PARTITION_INFO_EX: {
+        /* SET_PARTITION_INFORMATION_EX: style @0, MBR type byte @8; a GPT
+           request has no type byte to keep, so it is accepted as is */
+        NTSTATUS st;
+        if (inlen < 9) return Complete(Irp, STATUS_INVALID_PARAMETER, 0);
+        if (*(ULONG *)b != 0) return Complete(Irp, STATUS_SUCCESS, 0);
+        if (ext->Ldm) { st = LdmSetType(ext->Ldm, b[8]); if (NT_SUCCESS(st)) ext->PartitionType = b[8]; }
+        else st = SetVolumeType(ext, b[8]);
+        return Complete(Irp, st, 0);
+    }
+    case IOCTL_STORAGE_GET_DEVICE_NUMBER:
+        /* a dynamic volume lies on several disks and has no number, as on
+           Windows */
+        if (ext->Ldm) return Complete(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+        if (outlen < 12) return Complete(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+        ((ULONG *)b)[0] = FILE_DEVICE_DISK; ((ULONG *)b)[1] = ext->DiskNumber;
+        ((ULONG *)b)[2] = ext->PartitionNumber;
+        return Complete(Irp, STATUS_SUCCESS, 12);
+    }
+    *handled = 0;
+    return STATUS_SUCCESS;
+}
 
 static NTSTATUS NTAPI DispDeviceControl(PDEVICE_OBJECT Dev, PIRP Irp)
 {
@@ -196,6 +365,9 @@ static NTSTATUS NTAPI DispDeviceControl(PDEVICE_OBJECT Dev, PIRP Irp)
     if (ext->Kind == KIND_CTRL) return ControlIoctl(Irp, code, sys, inlen, outlen);
     if (ext->Gone) return Complete(Irp, STATUS_NO_SUCH_DEVICE, 0);
     if (ext->Ldm) return LdmDeviceControl(ext, Irp, code, sys, inlen, outlen);
+    { int h; NTSTATUS st = VolumeIoctlEx(ext, Irp, code, sys, inlen, outlen,
+                                         (gpt_u64)ext->StartingOffset.QuadPart, &h);
+      if (h) return st; }
     switch (code) {
     case IOCTL_DISK_GET_PARTITION_INFO: {
         PPARTITION_INFORMATION pi = (PPARTITION_INFORMATION)sys;
@@ -215,9 +387,14 @@ static NTSTATUS NTAPI DispDeviceControl(PDEVICE_OBJECT Dev, PIRP Irp)
         if (inlen < 1) return Complete(Irp, STATUS_INVALID_PARAMETER, 0);
         return Complete(Irp, SetVolumeType(ext, *(UCHAR *)sys), 0);
     case IOCTL_DISK_VERIFY:
-        /* VERIFY_INFORMATION.StartingOffset is volume-relative */
-        if (inlen >= sizeof(LARGE_INTEGER) + sizeof(ULONG))
+        /* VERIFY_INFORMATION.StartingOffset is volume-relative; the disk
+           driver cannot verify past its reach, which is reported good */
+        if (inlen >= sizeof(LARGE_INTEGER) + sizeof(ULONG)) {
+            gpt_u64 vs = (gpt_u64)((PLARGE_INTEGER)sys)->QuadPart + (gpt_u64)ext->StartingOffset.QuadPart;
+            if (ext->BigFrom && vs + *(ULONG *)((UCHAR *)sys + sizeof(LARGE_INTEGER)) > ext->BigFrom)
+                return Complete(Irp, STATUS_SUCCESS, 0);
             ((PLARGE_INTEGER)sys)->QuadPart += ext->StartingOffset.QuadPart;
+        }
         nxt = IoGetNextIrpStackLocation(Irp);
         CopyStackDown(nxt, cur, ext->LowerDevice);
         return IoCallDriver(ext->LowerDevice, Irp);
@@ -257,7 +434,7 @@ static UCHAR AssignDriveLetter(const char *DeviceName)
     return 0;
 }
 
-static void PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNumber, GPT_PARTITION *P, ULONG Bps)
+static void PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNumber, GPT_PARTITION *P, ULONG Bps, gpt_u64 BigFromLba)
 {
     char name[48]; UNICODE_STRING uname; PDEVICE_OBJECT dev, p0dev; PFILE_OBJECT p0file; PPART_EXT ext; NTSTATUS st;
     (void)Part0;
@@ -275,7 +452,7 @@ static void PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartN
     ext->DiskNumber = DiskNumber; ext->PartitionNumber = PartNumber;
     ext->PartitionType = P->MbrType; ext->BootIndicator = P->BootIndicator ? 1 : 0;
     ext->Recognized = P->Recognized ? 1 : 0; ext->DriveLetter = 0; ext->Stale = 0; ext->Gone = 0;
-    ext->Ldm = NULL; { int k = 0; while (name[k] && k < 39) { ext->DevName[k] = name[k]; k++; } ext->DevName[k] = 0; }
+    ext->Ldm = NULL; ext->BigFrom = BigFromLba * (gpt_u64)Bps; { int k = 0; while (name[k] && k < 39) { ext->DevName[k] = name[k]; k++; } ext->DevName[k] = 0; }
     dev->Flags |= DO_DIRECT_IO;
     dev->StackSize = (CCHAR)(p0dev->StackSize + 1);
     dev->AlignmentRequirement = p0dev->AlignmentRequirement;
@@ -312,17 +489,133 @@ static ULONG FirstFreePartitionIndex(ULONG DiskNumber)
     return 64;
 }
 
+/* The number of sectors the disk driver below reaches. The geometry
+   counts whole cylinders only and leaves out the partial last one; the
+   disk's real length comes from IOCTL_DISK_GET_LENGTH_INFO (XP and later)
+   or partition 0's length (the older releases), and is taken when its last
+   sector can really be read (NT 3.x's atdisk reports one it cannot reach).
+   Behind a driver with 32-bit sector numbers (NT 3.x - XP i386: READ
+   CAPACITY(10)) a disk past 2 TiB reports at most 2^32 sectors. With
+   Verify 0 (the 2-second disk check) the read is left out. */
+#define IOCTL_DISK_GET_LENGTH_INFO_ 0x0007405CUL
+static gpt_u64 DiskReach(PDEVICE_OBJECT part0, DISK_GEOMETRY *geo, int Verify)
+{
+    gpt_u64 total = (gpt_u64)geo->Cylinders.QuadPart * (gpt_u64)geo->TracksPerCylinder * (gpt_u64)geo->SectorsPerTrack;
+    gpt_u64 len = 0; ULONG bps = geo->BytesPerSector; int sh = 0; LARGE_INTEGER l; PARTITION_INFORMATION pi;
+    while (sh < 16 && (1UL << sh) < bps) sh++;
+    if (NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_LENGTH_INFO_, part0, NULL, 0, &l, sizeof(l))))
+        len = (gpt_u64)l.QuadPart >> sh;
+    else if (NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_PARTITION_INFO, part0, NULL, 0, &pi, sizeof(pi))))
+        len = (gpt_u64)pi.PartitionLength.QuadPart >> sh;
+    if (len > total) {
+        UCHAR *buf; LARGE_INTEGER off;
+        if (!Verify) return len;
+        buf = (UCHAR *)ExAllocatePool(NonPagedPool, bps);
+        if (!buf) return total;
+        off.QuadPart = (LONGLONG)((len - 1) << sh);
+        if (NT_SUCCESS(SyncTransfer(IRP_MJ_READ, part0, buf, bps, &off))) total = len;
+        ExFreePool(buf);
+    }
+    return total;
+}
+
+/* The geometry (all NT 3.x / 4.0 and 2000 have) can be short of the real
+   end: the table then tells where the disk ends, and a read shows whether
+   the driver below gets there. A GPT's backup header must be found at the
+   place the primary names (a driver with 32-bit sector numbers would read
+   some other sector instead); a partition end is only tried below 2^32
+   sectors, where no sector number can wrap. */
+static gpt_u64 ProbeEnd(ENUMCTX *ctx, GPT_DISK *disk, gpt_u64 total)
+{
+    gpt_u64 end = 0, best = total; ULONG i; UCHAR *buf;
+    for (i = 0; i < disk->Count; i++)
+        if (disk->Part[i].StartLba + disk->Part[i].SectorCount > end) end = disk->Part[i].StartLba + disk->Part[i].SectorCount;
+    if (disk->TableSectors <= total && end <= total) return total;
+    buf = (UCHAR *)ExAllocatePool(NonPagedPool, ctx->BytesPerSector);
+    if (!buf) return total;
+    if (disk->IsGpt && disk->TableSectors > total && EnumRead(ctx, disk->TableSectors - 1, 1, buf) == 0) {
+        static const char sig[8] = { 'E','F','I',' ','P','A','R','T' };
+        gpt_u64 my = 0; int k, ok = 1;
+        for (k = 0; k < 8; k++) if (buf[k] != (UCHAR)sig[k]) ok = 0;
+        for (k = 7; k >= 0; k--) my = (my << 8) | buf[24 + k];
+        if (ok && my == disk->TableSectors - 1) best = disk->TableSectors;
+    }
+    if (end > best && end <= ((gpt_u64)1 << 32) && EnumRead(ctx, end - 1, 1, buf) == 0) best = end;
+    ExFreePool(buf);
+    return best;
+}
+
+/* The device's own size, asked with READ CAPACITY(16) through the disk
+   driver (IOCTL_SCSI_PASS_THROUGH), for a disk the driver shows as 2 TiB.
+   Shown only: the driver below still reaches no further. 0 when the
+   device or the drivers cannot tell. */
+typedef struct _MG_SPT {
+    USHORT    Length;
+    UCHAR     ScsiStatus, PathId, TargetId, Lun, CdbLength, SenseInfoLength, DataIn;
+    ULONG     DataTransferLength, TimeOutValue;
+    ULONG_PTR DataBufferOffset;
+    ULONG     SenseInfoOffset;
+    UCHAR     Cdb[16];
+} MG_SPT;
+typedef struct _MG_SPTBUF { MG_SPT Spt; ULONG Fill; UCHAR Sense[32]; UCHAR Data[32]; } MG_SPTBUF;
+#define IOCTL_SCSI_PASS_THROUGH_ 0x0004D004UL
+static int NearCap(gpt_u64 n);
+#define GPT_REACH_SLACK_  16065u   /* one cylinder of 255 x 63 sectors */
+/* the device's last sector can be read with READ(16) */
+static int BigReachable(PDEVICE_OBJECT part0, gpt_u64 sectors, ULONG bps)
+{
+    UCHAR *buf = (UCHAR *)ExAllocatePool(NonPagedPool, bps); int ok;
+    if (!buf) return 0;
+    ok = NT_SUCCESS(BigIo(part0, 0, sectors - 1, bps, buf, bps));
+    ExFreePool(buf);
+    return ok;
+}
+static gpt_u64 DeviceSize(PDEVICE_OBJECT part0, ULONG bps)
+{
+    MG_SPTBUF *b = (MG_SPTBUF *)ExAllocatePool(NonPagedPool, sizeof(MG_SPTBUF));
+    gpt_u64 last = 0; ULONG len = 0; int i;
+    if (!b) return 0;
+    memset(b, 0, sizeof(*b));
+    b->Spt.Length = sizeof(MG_SPT); b->Spt.CdbLength = 16; b->Spt.SenseInfoLength = sizeof(b->Sense);
+    b->Spt.DataIn = 1 /* SCSI_IOCTL_DATA_IN */; b->Spt.DataTransferLength = sizeof(b->Data);
+    b->Spt.TimeOutValue = 10;
+    b->Spt.DataBufferOffset = (ULONG_PTR)((UCHAR *)b->Data - (UCHAR *)b);
+    b->Spt.SenseInfoOffset = (ULONG)((UCHAR *)b->Sense - (UCHAR *)b);
+    b->Spt.Cdb[0] = 0x9E; b->Spt.Cdb[1] = 0x10; b->Spt.Cdb[13] = sizeof(b->Data);   /* READ CAPACITY(16) */
+    if (NT_SUCCESS(SyncIoctl(IOCTL_SCSI_PASS_THROUGH_, part0, b, sizeof(*b), b, sizeof(*b))) && b->Spt.ScsiStatus == 0) {
+        for (i = 0; i < 8; i++) last = (last << 8) | b->Data[i];
+        for (i = 8; i < 12; i++) len = (len << 8) | b->Data[i];
+    }
+    ExFreePool(b);
+    if (len != bps || last == 0 || last == ~(gpt_u64)0) return 0;
+    return last + 1;
+}
+
+/* per disk: where the disk driver's reach ends when MBRGPTNT reaches past
+   it (0 = it does not), for tables built from scratch (initialize,
+   convert), which do not come from ParseDisk */
+static gpt_u64 g_drvSect[64];
 static ULONG ParseDisk(ULONG DiskNumber, GPT_DISK *disk)
 {
-    PFILE_OBJECT file; PDEVICE_OBJECT part0; DISK_GEOMETRY geo; ENUMCTX ctx; ULONG bps; gpt_u64 total; NTSTATUS st;
+    PFILE_OBJECT file; PDEVICE_OBJECT part0; DISK_GEOMETRY geo; ENUMCTX ctx; ULONG bps; gpt_u64 total, dev, big = 0; NTSTATUS st;
     if (!NT_SUCCESS(OpenPartition0(DiskNumber, &file, &part0))) return 0;
     st = SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, part0, NULL, 0, &geo, sizeof(geo));
     if (!NT_SUCCESS(st)) { ObDereferenceObject(file); return 0; }
     bps = geo.BytesPerSector;
     if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) { ObDereferenceObject(file); return 0; }
-    total = (gpt_u64)geo.Cylinders.QuadPart * (gpt_u64)geo.TracksPerCylinder * (gpt_u64)geo.SectorsPerTrack;
-    ctx.Part0 = part0; ctx.BytesPerSector = bps; ctx.Limit = 0;
+    total = DiskReach(part0, &geo, 1);
+    ctx.Part0 = part0; ctx.BytesPerSector = bps; ctx.Limit = 0; ctx.BigFrom = 0;
+    /* stopped at the 2 TiB limit: what is the device's real size, and can
+       MBRGPTNT reach it itself? */
+    dev = NearCap(total) ? DeviceSize(part0, bps) : 0;
+    if (dev > total + GPT_REACH_SLACK_ && total && BigReachable(part0, dev, bps)) { ctx.BigFrom = total; big = total; total = dev; }
     st = GptParse(EnumRead, &ctx, bps, total, disk);
+    if (st == GPT_OK) {
+        disk->DiskSectors = big ? total : ProbeEnd(&ctx, disk, total);
+        disk->DeviceSectors = dev;
+        disk->DriverSectors = big;
+        if (DiskNumber < MGPT_MAXDISK) g_drvSect[DiskNumber] = big;
+    }
     ObDereferenceObject(file);
     if (st != GPT_OK) return 0;
     disk->Heads = geo.TracksPerCylinder;
@@ -339,18 +632,122 @@ static int DiskOwned(GPT_DISK *disk, ULONG bps)
 
 /* ---- control device ---- */
 
-static void FillMgptPart(MGPT_PART *mp, GPT_PARTITION *p)
+/* A disk the driver below sees only partly: its GPT describes more than it
+   reaches, or it reports exactly 2^32 sectors - the most READ CAPACITY(10)
+   can say, so the disk is probably larger. A GPT is not written there: its
+   backup copy would land in the middle of the disk (or of a partition). */
+#define SATURATED_SECTORS ((gpt_u64)1 << 32)
+/* A disk past 2 TiB behind READ CAPACITY(10) shows up as 2^32 sectors
+   (last sector FFFFFFFFh), 2^32 - 1 (FFFFFFFEh: what a controller driver
+   such as AHCINT gives a class driver that cannot follow up with READ
+   CAPACITY(16)), 0 (Windows 2000 adds one to FFFFFFFFh in 32 bits), or as
+   the whole cylinders below that (the geometry, where the release has
+   nothing better). The device's own answer (DeviceSectors) settles it when
+   there is one. */
+static int NearCap(gpt_u64 n)
+{ return n == 0 || (n <= SATURATED_SECTORS && n + GPT_REACH_SLACK_ >= SATURATED_SECTORS); }
+static int IsCapped(const GPT_DISK *disk)
+{
+    gpt_u64 n = disk->DiskSectors;
+    if (disk->DriverSectors) return 0;          /* reached past the limit by BigIo */
+    if (disk->DeviceSectors) return disk->DeviceSectors > n + GPT_REACH_SLACK_;
+    return NearCap(n);
+}
+static ULONG ReachFlags(const GPT_DISK *disk)
+{
+    ULONG f = 0, i;
+    if (GptTableBeyondReach(disk)) f |= MGPT_R_TABLE;
+    /* 2^32 sectors, or none at all: Windows 2000's disk driver adds one to
+       the last sector number READ CAPACITY(10) gives in 32 bits, so a disk
+       past 2 TiB reports a size of 0 there */
+    if (IsCapped(disk)) f |= MGPT_R_CAPPED;
+    for (i = 0; i < disk->Count; i++) if (GptPartBeyondReach(disk, &disk->Part[i])) f |= MGPT_R_PARTS;
+    if (disk->DriverSectors) f |= MGPT_R_EXTENDED;
+    if (disk->Whole) f |= MGPT_R_WHOLE;
+    return f;
+}
+
+/* every partition table write goes through here */
+static int WriteTable(ENUMCTX *ctx, GPT_DISK *disk)
+{
+    if (GptTableBeyondReach(disk) || (disk->IsGpt && IsCapped(disk)) ||
+        disk->DiskSectors < 4096) return GPT_ERR_RANGE;
+    return GptWriteDisk(EnumRead, EnumWrite, ctx, disk);
+}
+#define STATUS_NONEXISTENT_SECTOR_ ((NTSTATUS)0xC0000015L)   /* ERROR_SECTOR_NOT_FOUND (27) */
+
+static void FillMgptPart(MGPT_PART *mp, GPT_PARTITION *p, const GPT_DISK *disk)
 {
     memset(mp, 0, sizeof(*mp));
     mp->StartLba = p->StartLba; mp->SectorCount = p->SectorCount; mp->MbrType = p->MbrType;
     mp->FsKind = p->FsKind;
     mp->Flags = (p->BootIndicator ? MGPT_F_BOOT : 0) | (p->IsLogical ? MGPT_F_LOGICAL : 0) |
-                (p->Recognized ? MGPT_F_RECOGNIZED : 0) | (p->IsGptEntry ? MGPT_F_GPTENTRY : 0);
+                (p->Recognized ? MGPT_F_RECOGNIZED : 0) | (p->IsGptEntry ? MGPT_F_GPTENTRY : 0) |
+                (disk && GptPartBeyondReach(disk, p) ? MGPT_F_BEYOND : 0);
     mp->DriveLetter = 0;
 }
 
 static int IsDynamicTable(GPT_DISK *disk);
 static void LdmLayout(ULONG dn, GPT_DISK *disk, MGPT_LAYOUT *lay);
+
+static NTSTATUS ResolveLink(PCWSTR linkName, PWSTR outBuf, USHORT outChars);
+/* ---- CD / DVD drives: shown with the file system on the disc --------
+   \Device\CdRomN is read like a disk without a partition table (2048-byte
+   sectors): ISO 9660, UDF (CD, DVD, BD), HFS and the rest of the list.
+   Nothing is written to them and no volume is published - the CD-ROM file
+   systems of Windows mount them. Returns 0 when there is no such drive;
+   *media 0 when it holds no data disc. */
+#define MGPT_MAXCD 8
+#define IOCTL_CDROM_GET_DRIVE_GEOMETRY_ 0x0002404CUL
+static int ParseCd(ULONG n, GPT_DISK *disk, int *media)
+{
+    char name[32]; UNICODE_STRING un; PFILE_OBJECT f; PDEVICE_OBJECT dev; DISK_GEOMETRY geo; ENUMCTX ctx;
+    int rec = 0; gpt_u8 kind = 0, type; gpt_u64 total;
+    *media = 0;
+    sprintf(name, "\\Device\\CdRom%lu", (unsigned long)n);
+    if (!NT_SUCCESS(MakeUnicode(name, &un))) return 0;
+    if (!NT_SUCCESS(IoGetDeviceObjectPointer(&un, 0, &f, &dev))) { RtlFreeUnicodeString(&un); return 0; }
+    RtlFreeUnicodeString(&un);
+    memset(disk, 0, sizeof(*disk));
+    disk->SectorSize = 2048; disk->Whole = 1;
+    if (NT_SUCCESS(SyncIoctl(IOCTL_CDROM_GET_DRIVE_GEOMETRY_, dev, NULL, 0, &geo, sizeof(geo))) ||
+        NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, dev, NULL, 0, &geo, sizeof(geo)))) {
+        total = (gpt_u64)geo.Cylinders.QuadPart * (gpt_u64)geo.TracksPerCylinder * (gpt_u64)geo.SectorsPerTrack;
+        if (geo.BytesPerSector == 2048 && total) {
+            ctx.Part0 = dev; ctx.BytesPerSector = 2048; ctx.Limit = 0; ctx.BigFrom = 0;
+            UCHAR *buf = (UCHAR *)ExAllocatePool(NonPagedPool, 2048);
+            disk->DiskSectors = total;
+            if (buf) {
+                type = GptDetectFs(EnumRead, &ctx, 2048, 0, total, buf, &rec, &kind);
+                ExFreePool(buf);
+                disk->Part[0].SectorCount = total; disk->Part[0].MbrType = type; disk->Part[0].FsKind = kind;
+                disk->Count = 1; *media = 1;
+            }
+        }
+    }
+    ObDereferenceObject(f);
+    return 1;
+}
+/* the drive letter of \Device\CdRomN, or 0 */
+static UCHAR CdLetter(ULONG n)
+{
+    WCHAR link[16], want[24], *t; UCHAR c; int i;
+    char w[24]; sprintf(w, "\\Device\\CdRom%lu", (unsigned long)n);
+    for (i = 0; w[i]; i++) want[i] = (WCHAR)w[i];
+    want[i] = 0;
+    t = (WCHAR *)ExAllocatePool(NonPagedPool, 280 * sizeof(WCHAR));
+    if (!t) return 0;
+    for (c = 'C'; c <= 'Z'; c++) {
+        const char *l = "\\DosDevices\\X:";
+        for (i = 0; l[i]; i++) link[i] = (WCHAR)(l[i] == 'X' ? c : l[i]);
+        link[i] = 0;
+        if (!NT_SUCCESS(ResolveLink(link, t, 280))) continue;
+        for (i = 0; want[i] && (t[i] | 0x20) == (want[i] | 0x20); i++) ;
+        if (!want[i] && !t[i]) { ExFreePool(t); return c; }
+    }
+    ExFreePool(t);
+    return 0;
+}
 
 static NTSTATUS DoList(PVOID sys, ULONG outlen, ULONG *info)
 {
@@ -366,7 +763,17 @@ static NTSTATUS DoList(PVOID sys, ULONG outlen, ULONG *info)
           di->DiskNumber = d; di->SectorSize = bps; di->TotalSectors = disk->DiskSectors;
           di->IsGpt = disk->IsGpt; di->PartCount = disk->Count; di->Owned = (ULONG)DiskOwned(disk, bps);
           di->Dynamic = (ULONG)IsDynamicTable(disk);
+          di->TableSectors = disk->TableSectors; di->Reach = ReachFlags(disk); di->DeviceSectors = disk->DeviceSectors; di->DriverSectors = disk->DriverSectors;
+          di->Media = 0;
           dl->Count++; }
+    }
+    for (d = 0; d < MGPT_MAXCD && dl->Count < MGPT_MAX_DISKS; d++) {
+        int media; MGPT_DISKINFO *di = &dl->Disk[dl->Count];
+        if (!ParseCd(d, disk, &media)) continue;
+        memset(di, 0, sizeof(*di));
+        di->DiskNumber = MGPT_CDROM | d; di->SectorSize = 2048; di->TotalSectors = disk->DiskSectors;
+        di->PartCount = disk->Count; di->Reach = MGPT_R_WHOLE; di->Media = 1;
+        dl->Count++;
     }
     ExFreePool(disk);
     *info = sizeof(MGPT_DISKLIST);
@@ -390,11 +797,25 @@ static NTSTATUS DoGetLayout(PVOID sys, ULONG inlen, ULONG outlen, ULONG *info)
     dn = *(ULONG *)sys;
     disk = (GPT_DISK *)ExAllocatePool(NonPagedPool, sizeof(GPT_DISK));
     if (!disk) return STATUS_INSUFFICIENT_RESOURCES;
+    if (dn & MGPT_CDROM) {
+        int media;
+        if (!ParseCd(dn & 0xFF, disk, &media)) { ExFreePool(disk); return STATUS_DEVICE_NOT_READY; }
+        memset(lay, 0, sizeof(*lay));
+        lay->DiskNumber = dn; lay->SectorSize = 2048; lay->TotalSectors = disk->DiskSectors;
+        lay->Count = disk->Count; lay->Reach = MGPT_R_WHOLE; lay->Media = 1;
+        if (disk->Count) {
+            FillMgptPart(&lay->Part[0], &disk->Part[0], NULL);
+            lay->Part[0].DriveLetter = CdLetter(dn & 0xFF);
+        }
+        ExFreePool(disk); *info = sizeof(MGPT_LAYOUT); return STATUS_SUCCESS;
+    }
     bps = ParseDisk(dn, disk);
     if (bps == 0) { ExFreePool(disk); return STATUS_DEVICE_NOT_READY; }
     lay->DiskNumber = dn; lay->SectorSize = bps; lay->TotalSectors = disk->DiskSectors;
     lay->IsGpt = disk->IsGpt; lay->Count = disk->Count;
     lay->ChsLimit = GptChsLimit(disk);
+    lay->TableSectors = disk->TableSectors; lay->Reach = ReachFlags(disk); lay->DeviceSectors = disk->DeviceSectors; lay->DriverSectors = disk->DriverSectors;
+    lay->Media = 0;
     owned = DiskOwned(disk, bps);
     lay->Dynamic = 0; lay->LdmGroup = 0; lay->LdmWritable = 0; lay->LdmMissing = 0;
     lay->PubStart = 0; lay->PubSize = 0; lay->DgName[0] = 0;
@@ -406,7 +827,7 @@ static NTSTATUS DoGetLayout(PVOID sys, ULONG inlen, ULONG outlen, ULONG *info)
     BuildLetterMap();
     for (i = 0; i < disk->Count && i < MGPT_MAX_PARTS; i++) {
         UCHAR letter = 0;
-        FillMgptPart(&lay->Part[i], &disk->Part[i]);
+        FillMgptPart(&lay->Part[i], &disk->Part[i], disk);
         if (!IsExtType(disk->Part[i].MbrType)) {
             /* a volume of ours (any disk), else the class driver's */
             letter = OwnedLetterAt(dn, disk->Part[i].StartLba, bps);
@@ -799,14 +1220,22 @@ static int ClassServes(ULONG dn, gpt_u64 off, gpt_u64 len, gpt_u8 type)
 }
 
 /* Should this driver publish a volume for partition g? */
-static int WantVolume(ULONG dn, GPT_PARTITION *g, ULONG bps, int owned, int classDisk)
+static int WantVolume(ULONG dn, const GPT_DISK *disk, GPT_PARTITION *g, ULONG bps, int owned, int classDisk)
 {
 #if defined(_WIN64)
     /* x64 Windows reads GPT, dynamic disks and every sector size itself */
-    (void)dn; (void)g; (void)bps; (void)owned; (void)classDisk;
+    (void)dn; (void)disk; (void)g; (void)bps; (void)owned; (void)classDisk;
     return 0;
 #endif
     if (IsExtType(g->MbrType)) return 0;
+    /* a disk without a partition table is left to the disk driver: its
+       file system is only shown */
+    if (disk->Whole) return 0;
+    /* a partition the disk driver does not reach to its end (past 2 TiB
+       behind 32-bit sector numbers) gets no volume: a file system mounted
+       on it would fail on its last part, and CHKDSK could take that for
+       damage */
+    if (GptPartBeyondReach(disk, g)) return 0;
     /* GPT reserved / LDM partitions and MBR dynamic disks hold no file system */
     if (g->FsKind == GPT_FS_MSR || g->FsKind == GPT_FS_LDMMETA || g->FsKind == GPT_FS_LDMDATA ||
         g->MbrType == GPT_MBRTYPE_LDM) return 0;
@@ -855,7 +1284,7 @@ static void SyncDisk(ULONG DiskNumber)
         if (bps)
             for (i = 0; i < disk->Count; i++) {
                 GPT_PARTITION *g = &disk->Part[i];
-                if (!WantVolume(DiskNumber, g, bps, owned, classDisk)) continue;
+                if (!WantVolume(DiskNumber, disk, g, bps, owned, classDisk)) continue;
                 if ((gpt_u64)p->StartingOffset.QuadPart == (gpt_u64)g->StartLba * bps &&
                     (gpt_u64)p->PartitionLength.QuadPart == (gpt_u64)g->SectorCount * bps) {
                     keep = 1;
@@ -907,12 +1336,12 @@ static void SyncDisk(ULONG DiskNumber)
             GPT_PARTITION *g = &disk->Part[i];
             gpt_u64 off = (gpt_u64)g->StartLba * bps;
             int have = 0;
-            if (!WantVolume(DiskNumber, g, bps, owned, classDisk)) continue;
+            if (!WantVolume(DiskNumber, disk, g, bps, owned, classDisk)) continue;
             LockList();
             for (p = g_PartList; p; p = p->Next)
                 if (p->DiskNumber == DiskNumber && !p->Stale && (gpt_u64)p->StartingOffset.QuadPart == off) { have = 1; break; }
             UnlockList();
-            if (!have) PublishPartition(part0, DiskNumber, FirstFreePartitionIndex(DiskNumber), g, bps);
+            if (!have) PublishPartition(part0, DiskNumber, FirstFreePartitionIndex(DiskNumber), g, bps, disk->DriverSectors);
         }
         ObDereferenceObject(file);
     }
@@ -1110,6 +1539,8 @@ static NTSTATUS LdmSetType(LDMRT *rt, UCHAR type);
 static NTSTATUS LdmDeviceControl(PPART_EXT ext, PIRP Irp, ULONG code, PVOID sys, ULONG inlen, ULONG outlen)
 {
     LDMRT *rt = ext->Ldm; PIO_STACK_LOCATION cur = IoGetCurrentIrpStackLocation(Irp), nxt;
+    { int h; NTSTATUS st = VolumeIoctlEx(ext, Irp, code, sys, inlen, outlen, rt->FirstOff, &h);
+      if (h) return st; }
     switch (code) {
     case IOCTL_DISK_GET_PARTITION_INFO: {
         PPARTITION_INFORMATION pi = (PPARTITION_INFORMATION)sys;
@@ -1140,8 +1571,25 @@ static NTSTATUS LdmDeviceControl(PPART_EXT ext, PIRP Irp, ULONG code, PVOID sys,
     }
 }
 
+/* The members volume m can use: present, and holding m's pieces within
+   the part of the disk the disk driver reaches */
+static void VolPresent(LDMGRP *g, LDM_VMAP *m, gpt_u8 *pr)
+{
+    ULONG i, pl, x;
+    for (i = 0; i < LDM_MAX_DISKS; i++) pr[i] = g->Present[i];
+    for (pl = 0; pl < m->NPlex; pl++)
+        for (x = 0; x < m->Plex[pl].N; x++) {
+            LDM_X *e = &m->Plex[pl].X[x];
+            if (e->Disk < LDM_MAX_DISKS && g->Total[e->Disk] &&
+                e->ByteStart + e->Size > g->Total[e->Disk] * (gpt_u64)g->Bps[e->Disk])
+                pr[e->Disk] = 0;
+        }
+}
+static int VolState(LDMGRP *g, LDM_VMAP *m)
+{ gpt_u8 pr[LDM_MAX_DISKS]; VolPresent(g, m, pr); return LdmMapState(m, pr); }
+
 /* ---- reading volumes outside the I/O path (file system detection) ---- */
-typedef struct _SCANCTX { LDMGRP *g; LDM_VMAP *m; } SCANCTX;
+typedef struct _SCANCTX { LDMGRP *g; LDM_VMAP *m; gpt_u8 Pr[LDM_MAX_DISKS]; } SCANCTX;
 
 static int ScanDiskIo(void *ctx, gpt_u32 d, int write, gpt_u64 off, gpt_u32 len, void *buf)
 {
@@ -1157,15 +1605,15 @@ static int ScanDiskIo(void *ctx, gpt_u32 d, int write, gpt_u64 off, gpt_u32 len,
 static int ScanVolRead(void *ctx, gpt_u64 lba, gpt_u32 count, void *buf)
 {
     SCANCTX *c = (SCANCTX *)ctx;
-    return LdmVolIo(c->m, c->g->Present, ScanDiskIo, c, 0, lba * 512, count * 512, buf, g_scanScratch + 4096) ? 1 : 0;
+    return LdmVolIo(c->m, c->Pr, ScanDiskIo, c, 0, lba * 512, count * 512, buf, g_scanScratch + 4096) ? 1 : 0;
 }
 
 /* file system kind (GPT_FS_*) of volume vi, 0 when unreadable */
 static UCHAR LdmVolFs(LDMGRP *g, int vi, LDM_VMAP *m)
 {
     SCANCTX c; int rec = 0; gpt_u8 kind = 0;
-    if (!g_scanScratch || LdmMapState(m, g->Present) == LDM_FAILED) return 0;
-    c.g = g; c.m = m;
+    if (!g_scanScratch || VolState(g, m) == LDM_FAILED) return 0;
+    c.g = g; c.m = m; VolPresent(g, m, c.Pr);
     KeWaitForSingleObject(&g_LdmScanBufLock, Executive, KernelMode, FALSE, NULL);
     GptDetectFs(ScanVolRead, &c, 512, 0, m->Size / 512, g_scanScratch, &rec, &kind);
     KeSetEvent(&g_LdmScanBufLock, 0, FALSE);
@@ -1206,7 +1654,7 @@ static int LdmScan(LDMGRP **out)
         if (i == (int)disk->Count) continue;
         if (!NT_SUCCESS(OpenPartition0(d, &f, &p0))) continue;
         h = (LDM_HDR *)ExAllocatePool(NonPagedPool, sizeof(LDM_HDR));
-        ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0;
+        ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0; ctx.BigFrom = 0;
         if (!h || LdmReadHeader(EnumRead, &ctx, bps, disk->DiskSectors, disk, h) != GPT_OK) {
             if (h) ExFreePool(h);
             ObDereferenceObject(f); continue;
@@ -1220,7 +1668,7 @@ static int LdmScan(LDMGRP **out)
         if (gi < 0 || nm >= SCAN_MAX) { ExFreePool(h); ObDereferenceObject(f); continue; }
         MemZero(tmp, sizeof(*tmp));
         mem[nm].nt = d; mem[nm].grp = gi; mem[nm].hdr = h; mem[nm].committed = 0; mem[nm].ok = 0;
-        mem[nm].total = disk->DiskSectors;
+        mem[nm].total = disk->DriverSectors ? disk->DriverSectors : disk->DiskSectors;
         k = LdmReadDb(EnumRead, &ctx, h, tmp);
         D("  db rc="); DH(k); D(" committed="); DH((ULONG)tmp->Committed); D("\n");
         if (k == GPT_OK) {
@@ -1293,6 +1741,8 @@ static void LdmPublish(LDMGRP *g, int vi, LDM_VMAP *m)
 {
     char name[40]; UNICODE_STRING un; PDEVICE_OBJECT dev; PPART_EXT ext; LDMRT *rt; NTSTATUS st;
     LDM_VOL *v = &g->Db->Vol[vi]; int i, state; CCHAR stack = 1; ULONG align = 0; PDEVICE_OBJECT first = NULL;
+    gpt_u8 pr[LDM_MAX_DISKS];
+    VolPresent(g, m, pr);
     rt = (LDMRT *)ExAllocatePool(NonPagedPool, sizeof(LDMRT));
     if (!rt) return;
     MemZero(rt, sizeof(*rt));
@@ -1300,7 +1750,7 @@ static void LdmPublish(LDMGRP *g, int vi, LDM_VMAP *m)
     memcpy(rt->Guid, v->Guid, 16); StrCopy(rt->DgGuid, g->DgGuid, 40);
     for (i = 0; i < LDM_MAX_DISKS; i++) {
         rt->NtDisk[i] = g->NtDisk[i];
-        if (i >= (int)g->Db->NDisks || !g->Present[i] || !LdmMapUsesDisk(m, (gpt_u32)i)) continue;
+        if (i >= (int)g->Db->NDisks || !pr[i] || !LdmMapUsesDisk(m, (gpt_u32)i)) continue;
         if (!NT_SUCCESS(OpenPartition0(g->NtDisk[i], &rt->File[i], &rt->Dev[i]))) { rt->File[i] = NULL; rt->Dev[i] = NULL; continue; }
         rt->Present[i] = 1;
         if (rt->Dev[i]->StackSize >= stack) stack = (CCHAR)(rt->Dev[i]->StackSize + 1);
@@ -1377,16 +1827,17 @@ static void LdmSync(void)
         int keep = 0;
         if (!p->Ldm || p->Gone) { if (p->Ldm) p->Stale = 1; continue; }
         for (k = 0; k < nn && !keep; k++) {
-            LDMGRP *g = ng[k]; LDMRT *rt = p->Ldm; int i, st;
+            LDMGRP *g = ng[k]; LDMRT *rt = p->Ldm; int i, st; gpt_u8 pr[LDM_MAX_DISKS];
             if (g->Native || !StrSame(g->DgGuid, rt->DgGuid)) continue;
             v = LdmFindVol(g, rt->Guid);
             if (v < 0 || LdmMap(g, v, m) != GPT_OK) break;
-            st = LdmMapState(m, g->Present);
+            st = VolState(g, m);
             if (st == LDM_FAILED || !MemSame(m, &rt->Map, sizeof(LDM_VMAP))) break;
             if (rt->ReadOnly != (st != LDM_HEALTHY)) break;
             keep = 1;
+            VolPresent(g, m, pr);
             for (i = 0; i < (int)g->Db->NDisks && i < LDM_MAX_DISKS; i++)
-                if (LdmMapUsesDisk(m, (gpt_u32)i) && (rt->Present[i] != g->Present[i] || (g->Present[i] && rt->NtDisk[i] != g->NtDisk[i]))) keep = 0;
+                if (LdmMapUsesDisk(m, (gpt_u32)i) && (rt->Present[i] != pr[i] || (pr[i] && rt->NtDisk[i] != g->NtDisk[i]))) keep = 0;
             if (keep) p->PartitionType = g->Db->Vol[v].PartType;
         }
         p->Stale = (UCHAR)(keep ? 0 : 1);
@@ -1403,7 +1854,7 @@ static void LdmSync(void)
             for (p = g_PartList; p; p = p->Next)
                 if (p->Ldm && !p->Stale && StrSame(p->Ldm->DgGuid, g->DgGuid) && MemSame(p->Ldm->Guid, g->Db->Vol[v].Guid, 16)) have = 1;
             UnlockList();
-            if (have || LdmMap(g, v, m) != GPT_OK || LdmMapState(m, g->Present) == LDM_FAILED) continue;
+            if (have || LdmMap(g, v, m) != GPT_OK || VolState(g, m) == LDM_FAILED) continue;
             LdmPublish(g, v, m);
         }
     }
@@ -1442,7 +1893,7 @@ static int ProbeDisk(ULONG d, DISKID *id)
     bps = geo.BytesPerSector;
     if (!NT_SUCCESS(st) || (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096)) { ObDereferenceObject(file); return 0; }
     id->bps = bps;
-    id->total = (gpt_u64)geo.Cylinders.QuadPart * (gpt_u64)geo.TracksPerCylinder * (gpt_u64)geo.SectorsPerTrack;
+    id->total = DiskReach(part0, &geo, 0);
     id->removable = (geo.MediaType == RemovableMedia) ? 1 : 0;
     if (id->removable) {
         UCHAR *buf = (UCHAR *)ExAllocatePool(NonPagedPool, 2 * bps);
@@ -1615,10 +2066,13 @@ static NTSTATUS WriteAndReenumLocked(ULONG DiskNumber, GPT_DISK *disk)
             disk->Heads = geo.TracksPerCylinder; disk->SectorsPerTrack = geo.SectorsPerTrack;
         }
     }
-    ctx.Part0 = part0; ctx.BytesPerSector = disk->SectorSize; ctx.Limit = 0;
-    rc = GptWriteDisk(EnumRead, EnumWrite, &ctx, disk);
+    if (!disk->DriverSectors && DiskNumber < MGPT_MAXDISK && g_drvSect[DiskNumber] < disk->DiskSectors)
+        disk->DriverSectors = g_drvSect[DiskNumber];
+    ctx.Part0 = part0; ctx.BytesPerSector = disk->SectorSize; ctx.Limit = 0; ctx.BigFrom = disk->DriverSectors;
+    rc = WriteTable(&ctx, disk);
     TellDiskDriver(part0);
     ObDereferenceObject(file);
+    if (rc == GPT_ERR_RANGE) return STATUS_NONEXISTENT_SECTOR_;
     if (rc != GPT_OK) return STATUS_UNSUCCESSFUL;
     SyncDiskInSystem(DiskNumber);
     return STATUS_SUCCESS;
@@ -1661,11 +2115,12 @@ static NTSTATUS SetVolumeType(PPART_EXT ext, UCHAR type)
         type = GptPickType(disk, GptTypeFamily(type), disk->Part[i].StartLba, disk->Part[i].SectorCount);
     GptSetType(disk, i, type);
     if (!NT_SUCCESS(OpenPartition0(ext->DiskNumber, &file, &part0))) { ExFreePool(disk); return STATUS_DEVICE_NOT_READY; }
-    ctx.Part0 = part0; ctx.BytesPerSector = bps; ctx.Limit = 0;
-    rc = GptWriteDisk(EnumRead, EnumWrite, &ctx, disk);
+    ctx.Part0 = part0; ctx.BytesPerSector = bps; ctx.Limit = 0; ctx.BigFrom = disk->DriverSectors;
+    rc = WriteTable(&ctx, disk);
     TellDiskDriver(part0);
     ObDereferenceObject(file);
     ExFreePool(disk);
+    if (rc == GPT_ERR_RANGE) return STATUS_NONEXISTENT_SECTOR_;
     if (rc != GPT_OK) return STATUS_UNSUCCESSFUL;
     ext->PartitionType = type;
     return STATUS_SUCCESS;
@@ -1674,25 +2129,23 @@ static NTSTATUS SetVolumeType(PPART_EXT ext, UCHAR type)
 static NTSTATUS DoSetLayout(PVOID sys, ULONG inlen)
 {
     MGPT_LAYOUT *lay = (MGPT_LAYOUT *)sys; GPT_DISK *disk; PFILE_OBJECT file; PDEVICE_OBJECT part0;
-    ULONG bps, i, pass; gpt_u64 total; DISK_GEOMETRY geo; NTSTATUS st;
+    ULONG bps, i, pass; gpt_u64 total, tableSectors, devSectors; NTSTATUS st;
     if (inlen < sizeof(MGPT_LAYOUT)) return STATUS_INVALID_PARAMETER;
     if (lay->Count > MGPT_MAX_PARTS) return STATUS_INVALID_PARAMETER;
     {
-        GPT_DISK *cur = LoadDisk(lay->DiskNumber, NULL); int dyn;
+        GPT_DISK *cur = LoadDisk(lay->DiskNumber, &bps); int dyn;
         if (!cur) return STATUS_DEVICE_NOT_READY;
-        dyn = IsDynamicTable(cur); ExFreePool(cur);
+        dyn = IsDynamicTable(cur); total = cur->DiskSectors; tableSectors = cur->TableSectors; devSectors = cur->DeviceSectors; ExFreePool(cur);
         if (dyn) return STATUS_NOT_SUPPORTED;
     }
-    if (!NT_SUCCESS(OpenPartition0(lay->DiskNumber, &file, &part0))) return STATUS_DEVICE_NOT_READY;
-    st = SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, part0, NULL, 0, &geo, sizeof(geo));
-    if (!NT_SUCCESS(st)) { ObDereferenceObject(file); return st; }
-    bps = geo.BytesPerSector;
-    total = (gpt_u64)geo.Cylinders.QuadPart * (gpt_u64)geo.TracksPerCylinder * (gpt_u64)geo.SectorsPerTrack;
-    ObDereferenceObject(file);
+    (void)file; (void)part0; (void)st;
     disk = (GPT_DISK *)ExAllocatePool(NonPagedPool, sizeof(GPT_DISK));
     if (!disk) return STATUS_INSUFFICIENT_RESOURCES;
     GptSeed((gpt_u32)total ^ 0x9E3779B9u);
     GptInitDisk(disk, lay->IsGpt ? GPT_SCHEME_GPT : GPT_SCHEME_MBR, bps, total);
+    /* keeps a table made for a larger disk than the driver reaches from
+       being rewritten (WriteTable) */
+    disk->TableSectors = tableSectors; disk->DeviceSectors = devSectors;
     for (pass = 0; pass < 2; pass++)
         for (i = 0; i < lay->Count; i++) {
             int isLog = (lay->Part[i].Flags & MGPT_F_LOGICAL) ? 1 : 0;
@@ -1893,6 +2346,14 @@ static NTSTATUS DoConvert(PVOID sys, ULONG inlen, ULONG *info)
         c->Reason = MGPT_CVT_SYSTEM; *info = sizeof(MGPT_CONVERT);
         ExFreePool(src); return STATUS_SUCCESS;
     }
+    if (src->Whole) {
+        c->Reason = MGPT_CVT_WHOLE; *info = sizeof(MGPT_CONVERT);
+        ExFreePool(src); return STATUS_SUCCESS;
+    }
+    if (ReachFlags(src) & (MGPT_R_TABLE | MGPT_R_PARTS) || (c->Scheme && IsCapped(src)) || src->DiskSectors < 4096) {
+        c->Reason = MGPT_CVT_REACH; *info = sizeof(MGPT_CONVERT);
+        ExFreePool(src); return STATUS_SUCCESS;
+    }
     dst = (GPT_DISK *)ExAllocatePool(NonPagedPool, sizeof(GPT_DISK));
     if (!dst) { ExFreePool(src); return STATUS_INSUFFICIENT_RESOURCES; }
     GptSeed((gpt_u32)src->DiskSectors ^ 0x7A5B3C1Du);
@@ -1903,7 +2364,7 @@ static NTSTATUS DoConvert(PVOID sys, ULONG inlen, ULONG *info)
     }
     st = WriteAndReenum(c->DiskNumber, dst);
     ExFreePool(dst); ExFreePool(src);
-    c->Reason = NT_SUCCESS(st) ? MGPT_CVT_OK : MGPT_CVT_WRITE;
+    c->Reason = NT_SUCCESS(st) ? MGPT_CVT_OK : st == STATUS_NONEXISTENT_SECTOR_ ? MGPT_CVT_REACH : MGPT_CVT_WRITE;
     *info = sizeof(MGPT_CONVERT);
     return STATUS_SUCCESS;
 }
@@ -2009,8 +2470,16 @@ static ULONG VolLetter(LDMGRP *g, int v, LDM_VMAP *m)
     return p ? p->DriveLetter : 0;
 }
 
+/* A member whose public region (where the volumes live) reaches past
+   what the disk driver reaches - a dynamic disk past 2 TiB behind 32-bit
+   sector numbers - is only partly usable: the group is not changed, and
+   volume pieces past the reachable end count as missing (VolPresent). */
+static int MemberShort(LDMGRP *g, ULONG i)
+{ return g->Present[i] && g->Total[i] && g->PubStart[i] + g->PubSize[i] > g->Total[i]; }
+static int GroupShort(LDMGRP *g)
+{ ULONG i; for (i = 0; i < g->Db->NDisks; i++) if (MemberShort(g, i)) return 1; return 0; }
 static int AllPresent(LDMGRP *g)
-{ ULONG i; for (i = 0; i < g->Db->NDisks; i++) if (!g->Present[i]) return 0; return 1; }
+{ ULONG i; for (i = 0; i < g->Db->NDisks; i++) if (!g->Present[i]) return 0; return !GroupShort(g); }
 
 /* the group index and database disk index of NT disk dn, or -1 */
 static int LdmGroupOf(ULONG dn, int *di)
@@ -2063,7 +2532,7 @@ static NTSTATUS DoLdmInfo(PVOID sys, ULONG outlen, ULONG *info)
             StrCopy(o2->Name, vv->Name, 16); memcpy(o2->Guid, vv->Guid, 16);
             o2->Type = (ULONG)vv->Type; o2->PartType = vv->PartType; o2->Size = vv->Size;
             if (LdmMap(g, v, m) == GPT_OK) {
-                st = LdmMapState(m, g->Present);
+                st = VolState(g, m);
                 o2->State = st == LDM_HEALTHY ? MGPT_LDMS_HEALTHY : st == LDM_DEGRADED ? MGPT_LDMS_DEGRADED : MGPT_LDMS_FAILED;
                 o2->Pieces = VolPieces(m);
                 o2->FsKind = LdmVolFs(g, v, m);
@@ -2099,13 +2568,13 @@ static void LdmLayout(ULONG dn, GPT_DISK *disk, MGPT_LAYOUT *lay)
         GPT_PARTITION *p = &disk->Part[i];
         if (p->MbrType == GPT_MBRTYPE_LDM && p->FsKind != GPT_FS_LDMMETA) continue;
         MemZero(&lay->Part[n], sizeof(MGPT_PART));
-        FillMgptPart(&lay->Part[n], p);
+        FillMgptPart(&lay->Part[n], p, disk);
         n++;
     }
     for (v = 0; v < (int)g->Db->NVols; v++) {
         int st = LDM_FAILED, pl, x; ULONG letter = 0, pieces = 0; UCHAR fs = 0;
         if (LdmMap(g, v, m) != GPT_OK) continue;
-        st = LdmMapState(m, g->Present);
+        st = VolState(g, m);
         if (!LdmMapUsesDisk(m, (gpt_u32)di)) continue;
         pieces = VolPieces(m); fs = LdmVolFs(g, v, m); letter = VolLetter(g, v, m);
         for (pl = 0; pl < (int)m->NPlex; pl++)
@@ -2151,7 +2620,7 @@ static LDM_DB *LdmLoadWork(LDMGRP *g)
     if (!db) return NULL;
     MemZero(db, sizeof(*db));
     if (!NT_SUCCESS(OpenPartition0(g->NtDisk[best], &f, &p0))) { ExFreePool(db); return NULL; }
-    ctx.Part0 = p0; ctx.BytesPerSector = g->Bps[best]; ctx.Limit = 0;
+    ctx.Part0 = p0; ctx.BytesPerSector = g->Bps[best]; ctx.Limit = 0; ctx.BigFrom = 0;
     rc = LdmReadDb(EnumRead, &ctx, g->Hdr[best], db);
     ObDereferenceObject(f);
     if (rc != GPT_OK) { LdmFreeDb(db); ExFreePool(db); return NULL; }
@@ -2175,7 +2644,7 @@ static int LdmCommit(LDMGRP *g, LDM_DB *db, int skip, ULONG extraNt, LDM_HDR *ex
         if (g->Hdr[i]->PrivStart + g->Hdr[i]->ConfStart + g->Hdr[i]->ConfSize + 2 > g->Total[i]) continue;
         done++;
         if (!NT_SUCCESS(OpenPartition0(g->NtDisk[i], &f, &p0))) { bad = 1; continue; }
-        ctx.Part0 = p0; ctx.BytesPerSector = g->Bps[i]; ctx.Limit = g->Total[i];
+        ctx.Part0 = p0; ctx.BytesPerSector = g->Bps[i]; ctx.Limit = g->Total[i]; ctx.BigFrom = 0;
         if (LdmWriteDisk(EnumWrite, &ctx, g->Hdr[i], db, (gpt_u64)now.QuadPart) != GPT_OK) { bad = 1; D("ldm write failed, disk "); DH(g->NtDisk[i]); D("\n"); }
         ObDereferenceObject(f);
     }
@@ -2183,7 +2652,7 @@ static int LdmCommit(LDMGRP *g, LDM_DB *db, int skip, ULONG extraNt, LDM_HDR *ex
         PFILE_OBJECT f; PDEVICE_OBJECT p0; ENUMCTX ctx;
         done++;
         if (!NT_SUCCESS(OpenPartition0(extraNt, &f, &p0))) return 1;
-        ctx.Part0 = p0; ctx.BytesPerSector = 512; ctx.Limit = 0;
+        ctx.Part0 = p0; ctx.BytesPerSector = 512; ctx.Limit = 0; ctx.BigFrom = 0;
         if (LdmWriteDisk(EnumWrite, &ctx, extraHdr, db, (gpt_u64)now.QuadPart) != GPT_OK) bad = 1;
         ObDereferenceObject(f);
     }
@@ -2239,7 +2708,7 @@ static NTSTATUS DoLdmCreate(PVOID sys, ULONG inlen, ULONG *info)
     if (c->Group >= (ULONG)g_ngrp || c->NDisks == 0 || c->NDisks > MGPT_LDM_DISKS || c->Type < 1 || c->Type > 5) goto out;
     g = g_grp[c->Group];
     if (g->Native) { c->Reason = MGPT_LDMR_NATIVE; goto out; }
-    if (!AllPresent(g)) { c->Reason = MGPT_LDMR_MISSING; goto out; }
+    if (!AllPresent(g)) { c->Reason = GroupShort(g) ? MGPT_LDMR_REACH : MGPT_LDMR_MISSING; goto out; }
     db = LdmLoadWork(g);
     if (!db) { c->Reason = MGPT_LDMR_WRITE; goto out; }
     if (db->NDisks != g->Db->NDisks) { c->Reason = MGPT_LDMR_MISSING; goto out; }
@@ -2302,8 +2771,8 @@ static void DropRetained(LDMGRP *g, LDM_DB *db, int vi)
                     PFILE_OBJECT f; PDEVICE_OBJECT p0; ENUMCTX ctx;
                     GptDeletePartition(disk, i);
                     if (NT_SUCCESS(OpenPartition0(g->NtDisk[di], &f, &p0))) {
-                        ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0;
-                        GptWriteDisk(EnumRead, EnumWrite, &ctx, disk);
+                        ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0; ctx.BigFrom = 0;
+                        WriteTable(&ctx, disk);
                         ObDereferenceObject(f);
                     }
                     break;
@@ -2333,7 +2802,7 @@ static NTSTATUS DoLdmDelete(PVOID sys, ULONG inlen, ULONG *info)
     if (r->Group >= (ULONG)g_ngrp) goto out;
     g = g_grp[r->Group];
     if (g->Native) { r->Reason = MGPT_LDMR_NATIVE; goto out; }
-    if (!AllPresent(g)) { r->Reason = MGPT_LDMR_MISSING; goto out; }
+    if (!AllPresent(g)) { r->Reason = GroupShort(g) ? MGPT_LDMR_REACH : MGPT_LDMR_MISSING; goto out; }
     db = LdmLoadWork(g);
     if (!db) { r->Reason = MGPT_LDMR_WRITE; goto out; }
     for (vi = 0; vi < (int)db->NVols; vi++) if (MemSame(db->Vol[vi].Guid, r->Guid, 16)) break;
@@ -2471,6 +2940,8 @@ static ULONG ToDynamic(ULONG dn)
     isGpt = disk->IsGpt;
     if (IsDynamicTable(disk)) { reason = MGPT_LDMR_SAME; goto out; }
     if (IsSystemDisk(dn, disk)) { reason = MGPT_LDMR_SYSTEM; goto out; }
+    if (disk->Whole) { reason = MGPT_LDMR_PARAM; goto out; }
+    if (ReachFlags(disk) & ~(ULONG)MGPT_R_WHOLE) { reason = MGPT_LDMR_REACH; goto out; }
     if (bps != 512) { reason = MGPT_LDMR_SECTOR; goto out; }
 #if defined(_WIN64)
     reason = MGPT_LDMR_NATIVE; goto out;
@@ -2479,7 +2950,7 @@ static ULONG ToDynamic(ULONG dn)
     /* the disk group to join: ours, else a new one */
     for (k = 0; k < g_ngrp; k++) if (!g_grp[k]->Native) { g = g_grp[k]; break; }
     if (!g && g_ngrp) { reason = MGPT_LDMR_FOREIGN; goto out; }
-    if (g && !AllPresent(g)) { reason = MGPT_LDMR_MISSING; goto out; }
+    if (g && !AllPresent(g)) { reason = GroupShort(g) ? MGPT_LDMR_REACH : MGPT_LDMR_MISSING; goto out; }
 
     if (!isGpt) {
         gpt_u64 cyl = (gpt_u64)(disk->Heads ? disk->Heads : 255) * (disk->SectorsPerTrack ? disk->SectorsPerTrack : 63), maxEnd = 63;
@@ -2608,8 +3079,8 @@ static ULONG ToDynamic(ULONG dn)
     LdmMakeHeader(h, isGpt, 512, pubStart, pubSize, privStart, 2048, dguid, db);
     if (LdmCommit(g, db, -1, dn, h)) { reason = MGPT_LDMR_WRITE; goto out; }
     if (!NT_SUCCESS(OpenPartition0(dn, &f, &p0))) { reason = MGPT_LDMR_WRITE; goto out; }
-    ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0;
-    k = GptWriteDisk(EnumRead, EnumWrite, &ctx, disk);
+    ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0; ctx.BigFrom = 0;
+    k = WriteTable(&ctx, disk);
     TellDiskDriver(p0);
     ObDereferenceObject(f);
     reason = (k == GPT_OK) ? MGPT_LDMR_OK : MGPT_LDMR_WRITE;
@@ -2628,13 +3099,15 @@ static ULONG ToBasic(ULONG dn)
     disk = LoadDisk(dn, &bps);
     if (!disk) return MGPT_LDMR_PARAM;
     if (!IsDynamicTable(disk)) { reason = MGPT_LDMR_SAME; goto out; }
+    if (disk->Whole) { reason = MGPT_LDMR_PARAM; goto out; }
+    if (ReachFlags(disk) & ~(ULONG)MGPT_R_WHOLE) { reason = MGPT_LDMR_REACH; goto out; }
     k = LdmGroupOf(dn, &di);
     if (k >= 0) {
         g = g_grp[k];
         if (g->Native) { reason = MGPT_LDMR_NATIVE; goto out; }
         for (i = 0; i < g->Db->NParts; i++) if (g->Db->Part[i].DiskId == g->Db->Disk[di].Id) { reason = MGPT_LDMR_NOTEMPTY; goto out; }
         if (g->Db->NDisks > 1) {
-            if (!AllPresent(g)) { reason = MGPT_LDMR_MISSING; goto out; }
+            if (!AllPresent(g)) { reason = GroupShort(g) ? MGPT_LDMR_REACH : MGPT_LDMR_MISSING; goto out; }
             db = LdmLoadWork(g);
             if (!db) { reason = MGPT_LDMR_WRITE; goto out; }
             for (i = 0; i < db->NDisks; i++) if (MemSame(db->Disk[i].Guid, g->Db->Disk[di].Guid, 16)) break;
@@ -2646,10 +3119,10 @@ static ULONG ToBasic(ULONG dn)
         h = g->Hdr[di];
     }
     if (!NT_SUCCESS(OpenPartition0(dn, &f, &p0))) { reason = MGPT_LDMR_WRITE; goto out; }
-    ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0;
+    ctx.Part0 = p0; ctx.BytesPerSector = bps; ctx.Limit = 0; ctx.BigFrom = 0;
     ctx.Limit = disk->DiskSectors;
     if (h) LdmWipeHeader(EnumWrite, &ctx, h);
-    ctx.Limit = 0;
+    ctx.Limit = 0; ctx.BigFrom = 0;
     if (!disk->IsGpt) {
         disk->Count = 0;
     } else {
@@ -2666,7 +3139,7 @@ static ULONG ToBasic(ULONG dn)
         /* the reserved partition gets its megabyte back */
         if (msr >= 0 && mc && disk->Part[msr].StartLba + disk->Part[msr].SectorCount == ms) disk->Part[msr].SectorCount += mc;
     }
-    k = GptWriteDisk(EnumRead, EnumWrite, &ctx, disk);
+    k = WriteTable(&ctx, disk);
     TellDiskDriver(p0);
     ObDereferenceObject(f);
     reason = (k == GPT_OK) ? MGPT_LDMR_OK : MGPT_LDMR_WRITE;
@@ -2778,6 +3251,10 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     Driver->MajorFunction[IRP_MJ_FLUSH_BUFFERS]  = (PVOID)DispPassThrough;
     Driver->MajorFunction[IRP_MJ_SHUTDOWN]       = (PVOID)DispPassThrough;
     CreateControlDevice();
+    KeInitializeEvent(&g_bigLock, SynchronizationEvent, TRUE);
+    KeInitializeEvent(&g_bigWake, SynchronizationEvent, FALSE);
+    st = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS, NULL, NULL, NULL, BigThread, NULL);
+    if (NT_SUCCESS(st)) { ZwClose(hThread); g_bigThread = 1; }
     st = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS, NULL, NULL, NULL, EnumThread, NULL);
     if (NT_SUCCESS(st)) ZwClose(hThread);
     return STATUS_SUCCESS;

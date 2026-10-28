@@ -5,7 +5,9 @@ The icon is a hard disk whose front shows a partition map (three volumes in
 the manager's colors) and an activity LED. Entries:
   16x16 and 32x32 at 4 bits (VGA palette) - NT 3.1 / 3.5 / 4.0 on 16 colors
   16x16, 32x32 and 48x48 at 32 bits with alpha - Windows XP and later
-usage: mkicon.py OUT.ico [PREVIEW.png]"""
+A badge in the lower right corner tells the tools apart:
+  none (the manager), console (mgptpart), install (mbrginst), uninstall (mbrgunin).
+usage: mkicon.py OUT.ico [PREVIEW.png] [none|console|install|uninstall]"""
 import struct, sys
 from PIL import Image, ImageDraw
 
@@ -104,6 +106,60 @@ def draw16_vga():
     return im
 
 
+BADGE = "none"
+
+
+def badge(im, vga):
+    """Draw the badge over the lower right corner of a finished image."""
+    if BADGE == "none":
+        return im
+    n = im.size[0]
+    if vga:
+        S = 1
+        big = im.copy()
+    else:
+        S = 8
+        big = im.resize((n * S, n * S), Image.NEAREST) if n <= 16 else None
+        if big is None:
+            big = Image.new("RGBA", (n * S, n * S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(big)
+    u = n * S / 32.0
+    def R(x0, y0, x1, y1):
+        return [round(x0*u), round(y0*u), round(x1*u)-1, round(y1*u)-1]
+    def P(x, y):
+        return (round(x*u), round(y*u))
+    W = (255, 255, 255, 255)
+    K = (0, 0, 0, 255)
+    lw = max(1, round(2.6*u)) if not vga else (2 if n >= 32 else 1)
+    if BADGE == "console":
+        d.rectangle(R(13, 15, 32, 32), fill=(255, 255, 255, 255) if not vga else W)
+        d.rectangle(R(14, 16, 31, 31), fill=(20, 24, 32, 255) if not vga else K)
+        d.rectangle(R(14, 16, 31, 19), fill=(46, 94, 170, 255) if not vga else (0, 0, 128, 255))
+        g = (90, 230, 120, 255) if not vga else (0, 255, 0, 255)
+        d.line([P(16.5, 21.5), P(20.5, 24.5), P(16.5, 27.5)], fill=g, width=lw)
+        d.line([P(22, 28.2), P(28, 28.2)], fill=g, width=lw)
+    else:
+        col = (40, 160, 70, 255) if BADGE == "install" else (205, 45, 45, 255)
+        if vga:
+            col = (0, 128, 0, 255) if BADGE == "install" else (255, 0, 0, 255)
+        d.ellipse(R(14, 14, 32, 32), fill=W)
+        d.ellipse(R(15, 15, 31, 31), fill=col)
+        if BADGE == "install":
+            d.line([P(23, 18), P(23, 27)], fill=W, width=lw)
+            d.line([P(19, 23.5), P(23, 27.5), P(27, 23.5)], fill=W, width=lw)
+        else:
+            d.line([P(19.3, 19.3), P(26.7, 26.7)], fill=W, width=lw)
+            d.line([P(26.7, 19.3), P(19.3, 26.7)], fill=W, width=lw)
+    if vga:
+        return big
+    if n <= 16:
+        return big.resize((n, n), Image.LANCZOS)
+    small = big.resize((n, n), Image.LANCZOS)
+    out = im.copy()
+    out.alpha_composite(small)
+    return out
+
+
 def nearest(c):
     return min(range(16), key=lambda i: sum((a-b)**2 for a, b in zip(c, VGA[i])))
 
@@ -149,8 +205,11 @@ def entry32(im):
 
 
 def main():
-    imgs = {s: draw(s) for s in (16, 32, 48)}
-    entries = [(16, 4, entry4(draw16_vga())), (32, 4, entry4(draw32_vga())),
+    global BADGE
+    if len(sys.argv) > 3:
+        BADGE = sys.argv[3]
+    imgs = {s: badge(draw(s), False) for s in (16, 32, 48)}
+    entries = [(16, 4, entry4(badge(draw16_vga(), True))), (32, 4, entry4(badge(draw32_vga(), True))),
                (16, 32, entry32(imgs[16])), (32, 32, entry32(imgs[32])), (48, 32, entry32(imgs[48]))]
     out = struct.pack("<HHH", 0, 1, len(entries))
     off = 6 + 16 * len(entries)
@@ -160,7 +219,7 @@ def main():
     for _, _, data in entries:
         out += data
     open(sys.argv[1], "wb").write(out)
-    if len(sys.argv) > 2:
+    if len(sys.argv) > 2 and sys.argv[2] != "-":
         sheet = Image.new("RGBA", (16*8 + 32*8 + 48*8 + 40, 48*8), (255, 255, 255, 255))
         x = 0
         for s in (16, 32, 48):

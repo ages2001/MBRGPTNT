@@ -1,0 +1,5 @@
+1 ICON "mgptins.ico"
+#define MG_DESC "MBRGPTNT installer"
+#define MG_NAME "mbrginst.exe"
+#define MG_TYPE 1
+#include "../src/mgptver.rc"

@@ -38,6 +38,42 @@ static const gpt_u8 GuidLdmData[16] = {
 
 static int GuidIsZero(const gpt_u8 *g){int i;for(i=0;i<16;i++)if(g[i])return 0;return 1;}
 
+static const gpt_u8 GuidLinuxSwap[16] = { 0x6D,0xFD,0x57,0x06,0xAB,0xA4,0xC4,0x43,0x84,0xE5,0x09,0x33,0xC8,0x4B,0x4F,0x4F };
+static const gpt_u8 GuidLinuxLvm[16] = { 0x79,0xD3,0xD6,0xE6,0x07,0xF5,0xC2,0x44,0xA2,0x3C,0x23,0x8F,0x2A,0x3D,0xF9,0x28 };
+static const gpt_u8 GuidLinuxRaid[16] = { 0x0F,0x88,0x9D,0xA1,0xFC,0x05,0x3B,0x4D,0xA0,0x06,0x74,0x3F,0x0F,0x84,0x91,0x1E };
+static const gpt_u8 GuidLinuxLuks[16] = { 0xCB,0x7C,0x7D,0xCA,0xED,0x63,0x53,0x4C,0x86,0x1C,0x17,0x42,0x53,0x60,0x59,0xCC };
+static const gpt_u8 GuidLinuxData[16] = { 0xAF,0x3D,0xC6,0x0F,0x83,0x84,0x72,0x47,0x8E,0x79,0x3D,0x69,0xD8,0x47,0x7D,0xE4 };
+static const gpt_u8 GuidBiosBoot[16] = { 0x48,0x61,0x68,0x21,0x49,0x64,0x6F,0x6E,0x74,0x4E,0x65,0x65,0x64,0x45,0x46,0x49 };
+static const gpt_u8 GuidAppleHfs[16] = { 0x00,0x53,0x46,0x48,0x00,0x00,0xAA,0x11,0xAA,0x11,0x00,0x30,0x65,0x43,0xEC,0xAC };
+static const gpt_u8 GuidAppleApfs[16] = { 0xEF,0x57,0x34,0x7C,0x00,0x00,0xAA,0x11,0xAA,0x11,0x00,0x30,0x65,0x43,0xEC,0xAC };
+static const gpt_u8 GuidAppleBoot[16] = { 0x74,0x6F,0x6F,0x42,0x00,0x00,0xAA,0x11,0xAA,0x11,0x00,0x30,0x65,0x43,0xEC,0xAC };
+static const gpt_u8 GuidAppleCs[16] = { 0x72,0x6F,0x74,0x53,0x67,0x61,0xAA,0x11,0xAA,0x11,0x00,0x30,0x65,0x43,0xEC,0xAC };
+static const gpt_u8 GuidFbsdSwap[16] = { 0xB5,0x7C,0x6E,0x51,0xCF,0x6E,0xD6,0x11,0x8F,0xF8,0x00,0x02,0x2D,0x09,0x71,0x2B };
+static const gpt_u8 GuidFbsdUfs[16] = { 0xB6,0x7C,0x6E,0x51,0xCF,0x6E,0xD6,0x11,0x8F,0xF8,0x00,0x02,0x2D,0x09,0x71,0x2B };
+static const gpt_u8 GuidFbsdZfs[16] = { 0xBA,0x7C,0x6E,0x51,0xCF,0x6E,0xD6,0x11,0x8F,0xF8,0x00,0x02,0x2D,0x09,0x71,0x2B };
+static const gpt_u8 GuidSolZfs[16] = { 0xC3,0x8C,0x89,0x6A,0xD2,0x1D,0xB2,0x11,0x99,0xA6,0x08,0x00,0x20,0x73,0x66,0x31 };
+
+/* When no file system is found in a GPT partition, its type GUID can
+   still say what it is (a swap area, an LVM or RAID member, ...): the
+   kind, and the MBR type byte that goes with it; 0 when the GUID says
+   nothing more */
+static gpt_u8 KindFromGuid(const gpt_u8 *g, gpt_u8 *kind)
+{
+    static const struct { const gpt_u8 *Guid; gpt_u8 Kind, Type; } map[] = {
+        { GuidLinuxSwap, GPT_FS_SWAP, 0x82 },   { GuidLinuxLvm, GPT_FS_LVM2, 0x8E },
+        { GuidLinuxRaid, GPT_FS_MDRAID, 0xFD }, { GuidLinuxLuks, GPT_FS_LUKS, 0x83 },
+        { GuidLinuxData, GPT_FS_LINUX, 0x83 },  { GuidBiosBoot, GPT_FS_BIOSBOOT, 0xEF },
+        { GuidAppleBoot, GPT_FS_APPLEBOOT, 0xAB }, { GuidAppleCs, GPT_FS_CORESTOR, 0xAF },
+        { GuidFbsdSwap, GPT_FS_BSDSWAP, 0xA5 }, { GuidFbsdUfs, GPT_FS_UFS2, 0xA5 },
+        { GuidFbsdZfs, GPT_FS_ZFS, 0xA5 },      { GuidSolZfs, GPT_FS_ZFS, 0xBF },
+        { GuidAppleHfs, GPT_FS_HFSPLUS, 0xAF }, { GuidAppleApfs, GPT_FS_APFS, 0xAF }
+    };
+    int i;
+    for (i = 0; i < (int)(sizeof(map) / sizeof(map[0])); i++)
+        if (MemEqual(g, map[i].Guid, 16)) { *kind = map[i].Kind; return map[i].Type; }
+    return 0;
+}
+
 static int StrAt(const gpt_u8 *buf,int off,const char *s)
 {int i;for(i=0;s[i];i++)if(buf[off+i]!=(gpt_u8)s[i])return 0;return 1;}
 
@@ -51,6 +87,9 @@ static gpt_u8 KindFromType(gpt_u8 t)
     case GPT_MBRTYPE_EXTENDL: return GPT_FS_EXTENDED;
     case GPT_MBRTYPE_EFISYS:  return GPT_FS_EFI;
     case 0x83:                return GPT_FS_LINUX;
+    case 0x82:                return GPT_FS_SWAP;
+    case 0x8E:                return GPT_FS_LVM2;
+    case 0xFD:                return GPT_FS_MDRAID;
     case GPT_MBRTYPE_LDM:     return GPT_FS_LDMDATA;
     default:                  return GPT_FS_UNKNOWN;
     }
@@ -90,54 +129,266 @@ static int FatFromBpb(const gpt_u8 *b, gpt_u8 *kind)
      sector 0      NTFS / exFAT / ReFS (OEM id), HPFS (0x36), FAT (BPB)
      byte 1024     ext2 / ext3 / ext4 superblock (magic EF53)
      byte 8192     HPFS superblock (magic F995E849), for a damaged boot block
-     byte 65536    Btrfs superblock ("_BHRfS_M" at +0x40) */
+     byte 32768    UDF volume recognition sequence, with the anchor at block 256
+     byte 65536    Btrfs superblock ("_BHRfS_M" at +0x40)
+   The boot-sector file systems come first: when a partition was
+   reformatted, the boot sector at sector 0 belongs to the newest one,
+   while signatures further in (UDF's, for one) may be left over. */
 static gpt_u8 DetectFs(GptReadProc Read, void *Ctx, gpt_u32 ss, gpt_u64 start,
                        gpt_u64 count, gpt_u8 *buf, int *recognized, gpt_u8 *kind);
+
+/* ReFS boot sector (all versions): file system name "ReFS" padded with
+   zeros, the "FSRS" structure at 0x10, a power-of-two sector size and a
+   volume that fits the partition. A bare "ReFS" string is not enough: a
+   partition reformatted with another file system can keep pieces of an
+   old boot sector. */
+static int IsRefsBoot(const gpt_u8 *b, gpt_u64 count)
+{
+    gpt_u32 bps = Le32(b + 0x20), spc = Le32(b + 0x24);
+    gpt_u64 n = Le64(b + 0x18);
+    if (!StrAt(b, 3, "ReFS") || b[7] || b[8] || b[9] || b[10]) return 0;
+    if (!StrAt(b, 0x10, "FSRS")) return 0;
+    if (bps < 512 || bps > 4096 || (bps & (bps - 1))) return 0;
+    if (spc == 0 || (spc & (spc - 1))) return 0;
+    if (n == 0) return 0;
+    (void)count;    /* the size is in the volume's own sectors, which can
+                       differ from the disk's; only sanity-checked above */
+    return 1;
+}
+
+/* UDF (ECMA-167 / OSTA UDF 1.02 - 2.60). Two independent proofs are
+   required:
+     - the Volume Recognition Sequence at byte 32768: a BEA01 descriptor
+       followed by NSR02 or NSR03;
+     - an Anchor Volume Descriptor Pointer at block 256 with a valid tag
+       (identifier 2, checksum, and its own location recorded in it), for
+       every block size from the sector size up to 4096.
+   Formatting another file system over UDF often leaves the recognition
+   sequence behind; it is only taken as UDF when no other file system was
+   found first and the anchor is intact too. */
+static int UdfTagOk(const gpt_u8 *t, gpt_u32 loc, gpt_u16 id)
+{
+    gpt_u8 sum = 0; int i;
+    if (Le16(t) != id) return 0;
+    for (i = 0; i < 16; i++) if (i != 4) sum = (gpt_u8)(sum + t[i]);
+    return sum == t[4] && Le32(t + 12) == loc;
+}
+
+static int IsUdf(GptReadProc Read, void *Ctx, gpt_u32 ss, gpt_u64 start,
+                 gpt_u64 count, gpt_u8 *buf)
+{
+    gpt_u32 step, off, bs;
+    int bea, nsr = 0, i;
+    /* descriptors are 2048 bytes apart, or one block apart when blocks are
+       larger: 4096 is the only larger block size seen on disks */
+    for (step = ss > 2048 ? ss : 2048; step <= 4096 && !nsr; step <<= 1)
+    for (bea = 0, i = 0, off = 32768; i < 16; i++, off += step) {
+        gpt_u64 lba = off / ss;
+        const gpt_u8 *d;
+        if (lba + 1 >= count || Read(Ctx, start + lba, 1, buf) != 0) return 0;
+        d = buf + (off % ss);
+        if (d[0] != 0 || d[6] != 1) break;               /* type 0, version 1 */
+        if (StrAt(d, 1, "BEA01")) bea = 1;
+        else if (bea && (StrAt(d, 1, "NSR02") || StrAt(d, 1, "NSR03"))) { nsr = 1; break; }
+        else if (StrAt(d, 1, "TEA01")) break;
+        else if (!StrAt(d, 1, "CD001") && !StrAt(d, 1, "BOOT2") && !StrAt(d, 1, "CDW02")) break;
+    }
+    if (!nsr) return 0;
+    for (bs = ss; bs <= 4096; bs <<= 1) {
+        gpt_u64 byteoff = (gpt_u64)256 * bs, lba = byteoff / ss;
+        if (lba + 1 >= count || Read(Ctx, start + lba, 1, buf) != 0) continue;
+        if (UdfTagOk(buf + (gpt_u32)(byteoff % ss), 256, 2)) return 1;
+    }
+    return 0;
+}
 gpt_u8 GptDetectFs(GptReadProc Read, void *Ctx, gpt_u32 ss, gpt_u64 start,
                    gpt_u64 count, gpt_u8 *buf, int *recognized, gpt_u8 *kind)
 { return DetectFs(Read, Ctx, ss, start, count, buf, recognized, kind); }
 
+/* reading a few bytes at a byte offset inside the volume */
+typedef struct _FSRD {
+    GptReadProc Read; void *Ctx; gpt_u64 Start, Count; gpt_u8 *Buf; int Shift; gpt_u32 Mask;
+    gpt_u64 Lba;    /* the sector now in Buf, ~0 = none */
+} FSRD;
+static const gpt_u8 *At(FSRD *r, gpt_u64 off)
+{
+    gpt_u64 lba = off >> r->Shift;
+    if (lba >= r->Count) return 0;
+    if (r->Lba != lba) {
+        if (r->Read(r->Ctx, r->Start + lba, 1, r->Buf) != 0) { r->Lba = ~(gpt_u64)0; return 0; }
+        r->Lba = lba;
+    }
+    return r->Buf + ((gpt_u32)off & r->Mask);
+}
+static gpt_u32 Be32(const gpt_u8 *p){return ((gpt_u32)p[0]<<24)|((gpt_u32)p[1]<<16)|((gpt_u32)p[2]<<8)|p[3];}
+static gpt_u16 Be16(const gpt_u8 *p){return (gpt_u16)(((gpt_u16)p[0]<<8)|p[1]);}
+/* a 32-bit magic number in either byte order */
+static int Magic32(const gpt_u8 *p, gpt_u32 m){ return p && (Le32(p) == m || Be32(p) == m); }
+
+/* bcachefs: the original magic and the one bcachefs 1.x writes */
+static const gpt_u8 BcachefsMagic[2][16] = {
+    { 0xC6,0x85,0x73,0xF6,0x4E,0x1A,0x45,0xCA,0x82,0x65,0xF5,0x7F,0x48,0xBA,0x6D,0x81 },
+    { 0xC6,0x85,0x73,0xF6,0x66,0xCE,0x90,0xA9,0xD9,0x6A,0x60,0xCF,0x80,0x3D,0xF7,0xEF } };
+
+#define FS(k, t) do { *kind = (gpt_u8)(k); return (gpt_u8)(t); } while (0)
+
+/* The checks, in the order blkid and the file systems themselves settle
+   which signature wins: boot-sector file systems first (a reformatted
+   partition keeps older signatures further in, but its first sector
+   belongs to the newest), then the superblocks by position, then the
+   weak or end-of-volume ones. The type byte returned is the one an MBR
+   would carry for it (what a GPT partition is shown as). */
 static gpt_u8 DetectFs(GptReadProc Read, void *Ctx, gpt_u32 ss, gpt_u64 start,
                        gpt_u64 count, gpt_u8 *buf, int *recognized, gpt_u8 *kind)
 {
-    gpt_u64 k;
+    FSRD r; const gpt_u8 *p, *q; gpt_u64 bytes; int i;
     *recognized = 0;
     *kind = GPT_FS_UNKNOWN;
-    if (Read(Ctx, start, 1, buf) != 0) return 0;
-    if (StrAt(buf, 3, "NTFS    "))  { *kind = GPT_FS_NTFS;  *recognized = 1; return GPT_MBRTYPE_IFS; }
-    if (StrAt(buf, 3, "EXFAT   "))  { *kind = GPT_FS_EXFAT; *recognized = 1; return GPT_MBRTYPE_IFS; }
-    if (StrAt(buf, 3, "ReFS") && buf[7] == 0) { *kind = GPT_FS_REFS; return GPT_MBRTYPE_IFS; }
-    if (StrAt(buf, 0x36, "HPFS    ")) { *kind = GPT_FS_HPFS; *recognized = 1; return GPT_MBRTYPE_IFS; }
-    if (FatFromBpb(buf, kind)) {
+    r.Read = Read; r.Ctx = Ctx; r.Start = start; r.Count = count; r.Buf = buf; r.Lba = ~(gpt_u64)0;
+    r.Shift = 0; while ((1u << r.Shift) < ss) r.Shift++;
+    r.Mask = ss - 1;
+    bytes = count << r.Shift;
+
+    /* ---- sector 0 ---- */
+    p = At(&r, 0);
+    if (!p) return 0;
+    if (StrAt(p, 3, "-FVE-FS-"))  FS(GPT_FS_BITLOCKER, GPT_MBRTYPE_IFS);
+    if (StrAt(p, 3, "NTFS    "))  { *recognized = 1; FS(GPT_FS_NTFS, GPT_MBRTYPE_IFS); }
+    if (StrAt(p, 3, "EXFAT   "))  { *recognized = 1; FS(GPT_FS_EXFAT, GPT_MBRTYPE_IFS); }
+    if (IsRefsBoot(p, count))     FS(GPT_FS_REFS, GPT_MBRTYPE_IFS);
+    if (StrAt(p, 0x36, "HPFS    ")) { *recognized = 1; FS(GPT_FS_HPFS, GPT_MBRTYPE_IFS); }
+    if (FatFromBpb(p, kind)) {
         *recognized = 1;
         if (*kind == GPT_FS_FAT12) return GPT_MBRTYPE_FAT12;
         if (*kind == GPT_FS_FAT16) return (count < 65536) ? GPT_MBRTYPE_FAT16S : GPT_MBRTYPE_FAT16;
         return GPT_MBRTYPE_FAT32L;
     }
-    /* ext2 / ext3 / ext4: told apart the way blkid does - a journal makes
-       ext3; any feature ext3 does not know (extents, 64-bit, flex_bg,
-       huge files, metadata checksums, ...) makes ext4 */
-    k = 1024 / ss;
-    if (count > k + 1 && Read(Ctx, start + k, 1, buf) == 0) {
-        const gpt_u8 *sb = buf + (1024 % ss);
-        if (Le16(sb + 0x38) == 0xEF53) {
-            gpt_u32 compat = Le32(sb + 0x5C), incompat = Le32(sb + 0x60), ro = Le32(sb + 0x64);
-            if ((incompat & ~0x16u) || (ro & ~0x07u)) *kind = GPT_FS_EXT4;
-            else if (compat & 0x04u)                   *kind = GPT_FS_EXT3;
-            else                                       *kind = GPT_FS_EXT2;
-            return 0x83;
+    if (StrAt(p, 0, "LUKS\xBA\xBE") || StrAt(p, 0, "SKUL\xBA\xBE")) FS(GPT_FS_LUKS, 0x83);
+    if (StrAt(p, 0, "XFSB"))      FS(GPT_FS_XFS, 0x83);
+    if (StrAt(p, 32, "NXSB"))     FS(GPT_FS_APFS, 0xAF);
+    if (StrAt(p, 0, "hsqs") || StrAt(p, 0, "sqsh")) FS(GPT_FS_SQUASHFS, 0x83);
+    if (Magic32(p, 0x28CD3D45u))  FS(GPT_FS_CRAMFS, 0x83);
+    if (Le32(p) == 0xA92B4EFCu)   FS(GPT_FS_MDRAID, 0xFD);        /* md 1.1 */
+    if (StrAt(p, 0, "-rom1fs-"))  FS(GPT_FS_ROMFS, 0x83);
+    if (Le32(p) == 0x1BADFACEu)   FS(GPT_FS_UNIXBFS, 0x83);
+    if (Le32(p) == 0xC5523031u && Le32(p + 4) == 0xC8414D4Du) FS(GPT_FS_HAMMER, 0xA5);
+    if (Le32(p) == 0x05172011u && Le32(p + 4) == 0x48414D32u) FS(GPT_FS_HAMMER2, 0xA5);
+    if (StrAt(p, 0, "DOS") && p[3] <= 7) FS(GPT_FS_AMIGA, 0x30);
+    if (Le16(p) == 0x1985 && (Le16(p + 2) == 0xE001 || Le16(p + 2) == 0xE002 || Le16(p + 2) == 0x2003 ||
+                              Le16(p + 2) == 0x2004 || Le16(p + 2) == 0x2006 || Le16(p + 2) == 0xE008 ||
+                              Le16(p + 2) == 0xE009)) FS(GPT_FS_JFFS2, 0x83);
+    if ((q = At(&r, 572)) != 0 && Le32(q) == 0x012FD16Du) FS(GPT_FS_XIAFS, 0x83);
+
+    /* ---- byte 512: LVM2 label, BeFS, SGI EFS ---- */
+    if ((q = At(&r, 512)) != 0) {
+        if (StrAt(q, 0, "LABELONE") && StrAt(q, 24, "LVM2 001")) FS(GPT_FS_LVM2, 0x8E);
+        if (Le32(q + 32) == 0x42465331u) FS(GPT_FS_BEFS, 0xEB);
+        if (Be32(q + 28) == 0x00072959u || Be32(q + 28) == 0x0007295Au) FS(GPT_FS_EFS, 0x83);
+    }
+    /* ---- byte 1024: ext, F2FS, NILFS2, EROFS, HFS family, VxFS, OCFS2 ---- */
+    if ((q = At(&r, 1024)) != 0) {
+        /* ext2 / ext3 / ext4: told apart the way blkid does - a journal
+           makes ext3; any feature ext3 does not know (extents, 64-bit,
+           flex_bg, huge files, metadata checksums, ...) makes ext4 */
+        if (Le16(q + 0x38) == 0xEF53) {
+            gpt_u32 compat = Le32(q + 0x5C), incompat = Le32(q + 0x60), ro = Le32(q + 0x64);
+            if ((incompat & ~0x16u) || (ro & ~0x07u)) FS(GPT_FS_EXT4, 0x83);
+            if (compat & 0x04u)                       FS(GPT_FS_EXT3, 0x83);
+            FS(GPT_FS_EXT2, 0x83);
         }
+        if (Le16(q + 0x38) == 0x137D) FS(GPT_FS_EXTFS, 0x83);
+        if (Le32(q) == 0xF2F52010u)   FS(GPT_FS_F2FS, 0x83);
+        if (Le16(q + 6) == 0x3434)    FS(GPT_FS_NILFS2, 0x83);
+        if (Le32(q) == 0xE0F5E1E2u)   FS(GPT_FS_EROFS, 0x83);
+        if (Le32(q) == 0xA501FCF5u)   FS(GPT_FS_VXFS, 0x83);
+        if (StrAt(q, 0, "OCFSV2"))    FS(GPT_FS_OCFS2, 0x83);
+        if (Be16(q) == 0x4244) {                      /* "BD": HFS, maybe wrapping HFS+ */
+            if (Be16(q + 0x7C) == 0x482B) FS(GPT_FS_HFSPLUS, 0xAF);
+            FS(GPT_FS_HFS, 0xAF);
+        }
+        if (Be16(q) == 0x482B && (Be16(q + 2) == 4 || Be16(q + 2) == 5)) FS(GPT_FS_HFSPLUS, 0xAF);
+        if (Be16(q) == 0x4858 && (Be16(q + 2) == 4 || Be16(q + 2) == 5)) FS(GPT_FS_HFSX, 0xAF);
+        if (Be16(q) == 0xD2D7)        FS(GPT_FS_MFS, 0xAF);
     }
-    k = 8192 / ss;
-    if (count > k + 1 && Read(Ctx, start + k, 1, buf) == 0) {
-        const gpt_u8 *sb = buf + (8192 % ss);
-        if (Le32(sb) == 0xF995E849u) { *kind = GPT_FS_HPFS; *recognized = 1; return GPT_MBRTYPE_IFS; }
+    /* the System V family keeps its magic at 0x3F8 of the superblock */
+    for (i = 0; i < 3; i++) {
+        static const gpt_u32 base[3] = { 0, 512, 1024 };
+        if ((q = At(&r, base[i] + 0x3F8)) == 0) continue;
+        if (Magic32(q, 0xFD187E20u)) FS(GPT_FS_SYSV, 0x63);
+        if ((q[0] == 0x2B && q[1] == 0x55 && q[2] == 0x44) || (q[0] == 0x44 && q[1] == 0x55 && q[2] == 0x2B)) FS(GPT_FS_XENIX, 0x02);
     }
-    k = 65536 / ss;
-    if (count > k + 1 && Read(Ctx, start + k, 1, buf) == 0 &&
-        StrAt(buf, (int)(65536 % ss) + 0x40, "_BHRfS_M")) { *kind = GPT_FS_BTRFS; return 0x83; }
+    if ((q = At(&r, 2048)) != 0 && StrAt(q, 0, "OCFSV2")) FS(GPT_FS_OCFS2, 0x83);
+    /* ---- byte 4096: bcachefs, md 1.2, swap (4 KB pages), OCFS2 ---- */
+    if ((q = At(&r, 4096)) != 0) {
+        int k, v;
+        for (v = 0; v < 2; v++) {
+            for (k = 0; k < 16 && q[24 + k] == BcachefsMagic[v][k]; k++) ;
+            if (k == 16) FS(GPT_FS_BCACHEFS, 0x83);
+        }
+        if (Le32(q) == 0xA92B4EFCu) FS(GPT_FS_MDRAID, 0xFD);
+        if (StrAt(q, 0, "OCFSV2")) FS(GPT_FS_OCFS2, 0x83);
+    }
+    if ((q = At(&r, 4086)) != 0 && (StrAt(q, 0, "SWAPSPACE2") || StrAt(q, 0, "SWAP-SPACE"))) FS(GPT_FS_SWAP, 0x82);
+    /* ---- byte 8192: HPFS, UFS1, old ReiserFS, QNX6, OCFS2 ---- */
+    if ((q = At(&r, 8192)) != 0) {
+        if (Le32(q) == 0xF995E849u) { *recognized = 1; FS(GPT_FS_HPFS, GPT_MBRTYPE_IFS); }
+        if (Le32(q) == 0x68191122u) FS(GPT_FS_QNX6, 0x4D);
+        if (StrAt(q, 0, "OCFSV2"))  FS(GPT_FS_OCFS2, 0x83);
+    }
+    if ((q = At(&r, 8192 + 52)) != 0 && StrAt(q, 0, "ReIsErFs")) FS(GPT_FS_REISERFS, 0x83);
+    /* UFS: the superblock is at 8 KB or 64 KB for either version */
+    if ((q = At(&r, 8192 + 1372)) != 0) {
+        if (Magic32(q, 0x19540119u)) FS(GPT_FS_UFS2, 0xA5);
+        if (Magic32(q, 0x00011954u)) FS(GPT_FS_UFS, 0xA5);
+    }
+    /* ---- byte 16384: swap with 16 KB pages ---- */
+    if ((q = At(&r, 16374)) != 0 && StrAt(q, 0, "SWAPSPACE2")) FS(GPT_FS_SWAP, 0x82);
+    if ((q = At(&r, 8182)) != 0 && StrAt(q, 0, "SWAPSPACE2")) FS(GPT_FS_SWAP, 0x82);
+    /* ---- byte 32768: JFS, UDF, ISO 9660 ---- */
+    if ((q = At(&r, 32768)) != 0 && StrAt(q, 0, "JFS1")) FS(GPT_FS_JFS, 0x83);
+    /* UDF before ISO 9660 (a UDF bridge disc has both) and before Btrfs:
+       mkfs.btrfs wipes foreign signatures, mkudffs leaves byte 65536 alone,
+       so with both present UDF is the newer one */
+    if (IsUdf(Read, Ctx, ss, start, count, buf)) { r.Lba = ~(gpt_u64)0; FS(GPT_FS_UDF, GPT_MBRTYPE_IFS); }
+    r.Lba = ~(gpt_u64)0;
+    if ((q = At(&r, 32768)) != 0 && StrAt(q, 1, "CD001") && q[6] == 1) FS(GPT_FS_ISO9660, GPT_MBRTYPE_IFS);
+    /* ---- byte 65536: Btrfs, ReiserFS 3.5 / 3.6, Reiser4, UFS2, GFS2, swap 64 KB ---- */
+    if ((q = At(&r, 65536)) != 0) {
+        if (StrAt(q, 0x40, "_BHRfS_M")) FS(GPT_FS_BTRFS, 0x83);
+        if (StrAt(q, 0, "ReIsEr4")) FS(GPT_FS_REISER4, 0x83);
+        if (Be32(q) == 0x01161970u && Be32(q + 4) == 1) FS(GPT_FS_GFS2, 0x83);
+        if (StrAt(q, 52, "ReIsErFs") || StrAt(q, 52, "ReIsEr2Fs") || StrAt(q, 52, "ReIsEr3Fs")) FS(GPT_FS_REISERFS, 0x83);
+    }
+    if ((q = At(&r, 65536 + 1372)) != 0) {
+        if (Magic32(q, 0x19540119u)) FS(GPT_FS_UFS2, 0xA5);
+        if (Magic32(q, 0x00011954u)) FS(GPT_FS_UFS, 0xA5);
+    }
+    if ((q = At(&r, 65526)) != 0 && StrAt(q, 0, "SWAPSPACE2")) FS(GPT_FS_SWAP, 0x82);
+    /* ---- byte 16384 / 131072: ZFS (vdev label nvlist, uberblocks) ---- */
+    if ((q = At(&r, 16384 + 0x10)) != 0) {
+        int k; for (k = 0; k + 9 <= 256 && k < (int)ss - 16 - 9; k++) if (StrAt(q, k, "pool_guid")) FS(GPT_FS_ZFS, 0xBF);
+    }
+    for (i = 0; i < 32; i++) {
+        q = At(&r, 131072 + (gpt_u64)i * 1024);
+        if (q && ((Le32(q) == 0x00BAB10Cu && Le32(q + 4) == 0) || (Be32(q + 4) == 0x00BAB10Cu && Be32(q) == 0))) FS(GPT_FS_ZFS, 0xBF);
+    }
+    /* ---- 1 MB: VMFS ---- */
+    if ((q = At(&r, 1048576)) != 0 && Le32(q) == 0xC001D00Du) FS(GPT_FS_VMFS, 0xFB);
+    /* ---- at the end: md RAID 0.90 and 1.0 ---- */
+    if (bytes >= 131072) {
+        gpt_u64 o90 = (bytes & ~(gpt_u64)65535) - 65536, o10 = ((bytes - 8192) & ~(gpt_u64)4095);
+        if ((q = At(&r, o90)) != 0 && Magic32(q, 0xA92B4EFCu)) FS(GPT_FS_MDRAID, 0xFD);
+        if ((q = At(&r, o10)) != 0 && Le32(q) == 0xA92B4EFCu) FS(GPT_FS_MDRAID, 0xFD);
+    }
+    /* ---- weak: Minix (a 16-bit magic only) ---- */
+    if ((q = At(&r, 1024)) != 0) {
+        gpt_u16 m = Le16(q + 16);
+        if ((m == 0x137F || m == 0x138F || m == 0x2468 || m == 0x2478) && Le16(q + 2) != 0) FS(GPT_FS_MINIX, 0x81);
+        if (Le16(q + 24) == 0x4D5A && Le16(q + 28) != 0) FS(GPT_FS_MINIX, 0x81);
+    }
     return 0;
 }
+#undef FS
 
 #define GPT_MAX_ENTRY_BYTES  (GPT_MAX_PARTITIONS * 128)
 
@@ -190,6 +441,9 @@ static int ParseHeaderAt(GptReadProc Read, void *Ctx, gpt_u32 ss,
     out->DiskSectors = diskSectors;
     out->Count = 0;
     (void)firstUsable; (void)lastUsable;
+    /* the size the table was written for: the backup header is the last
+       sector (read from the primary's pointer, or the backup's own LBA) */
+    out->TableSectors = (headerLba == 1 ? Le64(h + 32) : headerLba) + 1;
 
     for (i = 0; i < entryCount; i++) {
         const gpt_u8 *e = sc->Entries + (gpt_u64)i * entrySize;
@@ -228,6 +482,7 @@ static int ParseHeaderAt(GptReadProc Read, void *Ctx, gpt_u32 ss,
             /* GPT has no type byte: synthesise the one that fits the file
                system (07 when none is found) */
             got = DetectFs(Read, Ctx, ss, start, count, sc->Vbr, &recog, &pp->FsKind);
+            if (!got) got = KindFromGuid(e, &pp->FsKind);
             pp->MbrType = got ? (gpt_u8)got : GPT_MBRTYPE_IFS;
             pp->Recognized = (gpt_u8)recog;
         }
@@ -352,6 +607,28 @@ int GptParse(GptReadProc Read, void *Ctx, gpt_u32 SectorSize,
         GptScratchFree(sc);
         return rc;
     }
+    /* No partition table, one file system over the whole disk: a
+       superfloppy (its first sector is a boot sector, whose code bytes
+       would read as nonsense partition entries), or a disk without the MBR
+       signature that holds a file system (an ISO 9660 or UDF image, a
+       whole-disk ext / XFS / LUKS, ...) */
+    if (DiskSectors > 0) {
+        int recog = 0; gpt_u8 kind = 0, type;
+        int sig = (Le16(m + 510) == 0xAA55);
+        type = DetectFs(Read, Ctx, SectorSize, 0, DiskSectors, sc->Vbr, &recog, &kind);
+        if (type && (!sig || kind == GPT_FS_NTFS || kind == GPT_FS_EXFAT || kind == GPT_FS_REFS ||
+                     kind == GPT_FS_HPFS || kind == GPT_FS_FAT12 || kind == GPT_FS_FAT16 ||
+                     kind == GPT_FS_FAT32 || kind == GPT_FS_BITLOCKER)) {
+            GPT_PARTITION *pp = &Out->Part[0];
+            ZeroBytes((gpt_u8 *)pp, (gpt_u32)sizeof(*pp));
+            Out->IsGpt = 0; Out->Whole = 1; Out->SectorSize = SectorSize; Out->DiskSectors = DiskSectors;
+            pp->StartLba = 0; pp->SectorCount = DiskSectors; pp->MbrType = type; pp->FsKind = kind;
+            pp->Recognized = (gpt_u8)recog;
+            Out->Count = 1;
+            GptScratchFree(sc);
+            return GPT_OK;
+        }
+    }
     rc = ParseMbr(Read, Ctx, SectorSize, DiskSectors, sc, Out);
     GptScratchFree(sc);
     return rc;
@@ -409,7 +686,21 @@ static void UsableRange(const GPT_DISK *d, gpt_u64 *first, gpt_u64 *last)
     } else {
         *first = GPT_ALIGN;
         *last  = d->DiskSectors - 1;
+        /* an MBR entry holds 32-bit sector numbers */
+        if (*last > 0xFFFFFFFFu) *last = 0xFFFFFFFFu;
     }
+}
+
+#define GPT_REACH_SLACK 16065u   /* one cylinder of 255 x 63 sectors */
+
+int GptTableBeyondReach(const GPT_DISK *d)
+{
+    return d->IsGpt && d->TableSectors > d->DiskSectors + GPT_REACH_SLACK;
+}
+
+int GptPartBeyondReach(const GPT_DISK *d, const GPT_PARTITION *p)
+{
+    return p->SectorCount && p->StartLba + p->SectorCount > d->DiskSectors + GPT_REACH_SLACK;
 }
 
 static gpt_u64 AlignUp(gpt_u64 v){gpt_u32 r=(gpt_u32)(v%GPT_ALIGN);return r?(v+(GPT_ALIGN-r)):v;}
@@ -728,12 +1019,31 @@ int GptWriteDisk(GptReadProc Read, GptWriteProc Write, void *Ctx, GPT_DISK *d)
     int rc = GPT_OK;
 
     if (!Read || !Write || !d) return GPT_ERR_PARAM;
+    if (d->Whole) return GPT_ERR_PARAM;   /* would overwrite the file system's first sector */
     ss = d->SectorSize;
     diskSectors = d->DiskSectors;
     sc = GptScratchAlloc();
     if (!sc) return GPT_ERR_PARAM;
     m = sc->Sector; ent = sc->Entries; hdr = sc->Vbr;
 
+    /* nothing is written when a partition would not survive it: one
+       reaching into the GPT backup area at the end of the reachable disk
+       (it would be overwritten), or one an MBR entry cannot describe */
+    for (i = 0; i < d->Count; i++) {
+        const GPT_PARTITION *p = &d->Part[i];
+        gpt_u64 end = p->StartLba + p->SectorCount;
+        if (p->SectorCount == 0) continue;
+        if (d->IsGpt) {
+            gpt_u32 e2 = EntryArraySectors(ss);
+            if (diskSectors < 2 * (gpt_u64)e2 + 4 || p->StartLba < 2 + e2 || end > diskSectors - 1 - e2) {
+                GptScratchFree(sc); return GPT_ERR_RANGE;
+            }
+        } else if (p->StartLba > 0xFFFFFFFFu || p->SectorCount > 0xFFFFFFFFu) {
+            GptScratchFree(sc); return GPT_ERR_RANGE;
+        }
+    }
+
+    if (d->IsGpt && diskSectors < 2 * (gpt_u64)EntryArraySectors(ss) + 4) { GptScratchFree(sc); return GPT_ERR_RANGE; }
     if (d->IsGpt) {
         es = EntryArraySectors(ss);
         if (Read(Ctx, 0, 1, m) != 0) ZeroBytes(m, ss);
