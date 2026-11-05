@@ -1,0 +1,4 @@
+#define MG_DESC "MBRGPTNT drive-letter notifier"
+#define MG_NAME "mgptntfy.exe"
+#define MG_TYPE 1
+#include "../src/mgptver.rc"

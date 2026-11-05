@@ -233,6 +233,7 @@ __declspec(dllimport) int    WINAPI GetDeviceCaps(HDC,int);
 
 #include "../src/mgptioc.h"
 #include "../src/gptcore.h"   /* GPT_FS_* kinds and their names */
+#include "mgptbc.h"           /* drive-letter broadcast, hardware rescan */
 
 /* ------------------------------------------------------------------ */
 /* commands and icons                                                 */
@@ -659,8 +660,9 @@ static void reachNote(MGPT_DISKINFO*di,char*b){
     char sz[24], t[120];
     if(di->Reach&MGPT_R_WHOLE) scat(b,"  \xB7  one file system over the whole disk, shown only");
     if(di->Reach&MGPT_R_EXTENDED){
-        sizestr(di->DriverSectors,di->SectorSize,sz);
-        wsprintfA(t,"  \xB7  past %s through MBRGPTNT's own 16-byte commands",sz); scat(b,t);
+        if(di->DriverSectors<=1) scat(b,"  \xB7  no size from the disk driver: all through MBRGPTNT's own 16-byte commands");
+        else{ sizestr(di->DriverSectors,di->SectorSize,sz);
+              wsprintfA(t,"  \xB7  past %s through MBRGPTNT's own 16-byte commands",sz); scat(b,t); }
     }
     else if(di->DeviceSectors>di->TotalSectors&&di->TotalSectors){
         char s2[24]; sizestr(di->DeviceSectors,di->SectorSize,sz); sizestr(di->TotalSectors,di->SectorSize,s2);
@@ -1603,7 +1605,8 @@ static void bBody(int w){ dmk("STATIC",g_body,SS_LEFT,16,74,w-32,g_bodyH,300,g_f
 /* ------------------------------------------------------------------ */
 /* operations                                                         */
 
-static void notifyDrives(void){ PostMessageA(HWND_BROADCAST,WM_DEVICECHANGE,DBT_DEVNODES_CHANGED,0); }
+/* other MBRGPTNT windows reload; Explorer learns the letters that came or went */
+static void notifyDrives(void){ PostMessageA(HWND_BROADCAST,WM_DEVICECHANGE,DBT_DEVNODES_CHANGED,0); mgDrivesChanged(); }
 
 static void busy(const char*s){ setStatus(s); SetCursor(LoadCursorA(NULL,IDC_WAIT)); }
 
@@ -2047,12 +2050,18 @@ static void autoReload(int rescan){
     redraw();
 }
 
+/* Refresh: on Windows 2000 / XP first have Windows look for new hardware
+   (a disk plugged into a controller that does not report it by itself),
+   then have the driver look at the disks */
 static void cmdRefresh(void){
     DWORD gen, ret, before=diskMask();
+    busy("Looking for disks...");
+    mgHardwareRescan();
     if(g_drv==INVALID_HANDLE_VALUE)
         g_drv=CreateFileA("\\\\.\\MbrGptNt",GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
     if(g_drv!=INVALID_HANDLE_VALUE) DeviceIoControl(g_drv,IOCTL_MGPT_RESCAN,NULL,0,&gen,sizeof(gen),&ret,NULL);
-    loadModel(); fixSelection(); g_status[0]=0; reportDisks(before); redraw();
+    SetCursor(LoadCursorA(NULL,IDC_ARROW));
+    loadModel(); fixSelection(); g_status[0]=0; reportDisks(before); notifyDrives(); redraw();
 }
 
 static void runCmd(int cmd){
@@ -2231,6 +2240,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 void __stdcall GuiMain(void){
     WNDCLASSA wc; HWND hwnd; MSG msg; int sw, w=880, h=620, show=SW_SHOW;
     g_inst=GetModuleHandleA(NULL);
+    mgDrivesInit();
     g_oldNt=((GetVersion()&0xFF)<5)?1:0;
     g_drv=CreateFileA("\\\\.\\MbrGptNt",GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
     g_font =CreateFontA(13,0,0,0,400,0,0,0,0,0,0,0,0,"MS Sans Serif");

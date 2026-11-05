@@ -51,7 +51,8 @@ binary; the i386 driver runs unchanged on all 32-bit releases.
   and disks without a partition table are shown too.
 - **Disks past 2 TiB on 32-bit Windows**: the whole disk, through
   MBRGPTNT's own 16-byte SCSI commands (AHCINT, SCSI cards).
-- **Hot-plug**: USB disks and card readers come and go while Windows runs.
+- **Hot-plug**: USB and e-SATA disks and card readers come and go while
+  Windows runs, with their drive letters shown in Explorer at once.
 - **A graphical manager that runs on NT 3.1** and a command-line tool.
 - **x64** driver and tools for Windows XP x64 / Server 2003 x64.
 
@@ -147,9 +148,28 @@ binary; the i386 driver runs unchanged on all 32-bit releases.
   [USBNT](https://github.com/ages2001/USBNT); there, MBRGPTNT also mounts the
   partitions after the first one on an MBR stick, which the in-box disk
   driver does not.
+  A disk that is not fully readable when it shows up (still spinning up,
+  or a disk past 2 TiB whose real size or last sector does not answer yet)
+  is read again every 2 seconds for up to a minute, until its volumes can
+  be published.
+  **e-SATA and other disks the controller driver does not announce**:
+  Windows sees a disk plugged in while it runs only if the controller
+  driver reports it. Many do not (controllers in IDE mode, SCSI cards,
+  AHCINT); on Windows 2000 / XP, Refresh (F5) in the manager or `mgptpart
+  rescan` then has Windows scan for hardware changes (as Device Manager
+  does) and picks up what the controller driver finds on that scan.
+  Whether a disk plugged into a running controller is found at all is up
+  to the controller driver; one that only looks for disks at start-up
+  needs a restart. On NT 3.x / 4.0 the disk drivers find disks only at
+  start-up.
+  **Drive letters in Explorer**: on NT 4.0 and later the notifier
+  (`mgptntfy.exe`, started at every logon) tells Explorer about the drive
+  letters MBRGPTNT adds or removes, so an open My Computer window shows a
+  plugged-in disk's letters and drops an unplugged one's at once.
 * **All sector sizes** (512, 1024, 2048, 4096) for basic disks. Offsets
   come from the disk's reported geometry, so a 4Kn disk is handled
-  correctly for both reading and writing.
+  correctly for both reading and writing. (A 4Kn disk must be behind a
+  miniport that reports the real sector size.)
 * **x64**: a native x64 driver and x64 tools for Windows XP x64 / Server
   2003 x64, built from the same sources.
 
@@ -309,7 +329,10 @@ changed on NT 3.1 by adding a volume — imported back into Windows 2000.
 * The manager and the driver check the disks every 2 seconds. On Windows
   2000 / XP the manager also reacts to the system's device-change message
   at once. NT 3.x File Manager reads its drive list only when it starts, so
-  reopen it to see new letters; NT 4.0 and later update by themselves.
+  reopen it to see new letters; on NT 4.0 and later Explorer is told by
+  the notifier (`mgptntfy.exe`), the manager and `mgptpart`. A user who is
+  not an administrator may not be allowed to open the driver's control
+  device; the notifier then does nothing in that session.
 * Windows 2000 / XP: "Safely Remove Hardware" does not know about the
   volumes MBRGPTNT publishes for a GPT USB disk, so it does not flush them.
   Close the files on them first. A table changed on a *removable* disk (a
@@ -338,7 +361,11 @@ changed on NT 3.1 by adding a volume — imported back into Windows 2000.
   commands (AHCINT, SCSI cards) the **whole disk** is used: GPT initialize,
   partitions anywhere, volumes past and across 2 TiB with drive letters,
   formatted and written by Windows. The disk row says "past 2047.9 GB
-  through MBRGPTNT's own 16-byte commands". Where that path is not there
+  through MBRGPTNT's own 16-byte commands". Windows 2000 reports a disk
+  whose controller driver answers READ CAPACITY(10) with FFFFFFFFh (SCSI
+  cards, USB) as 0 bytes; there every sector past the first goes through
+  MBRGPTNT's commands ("no size from the disk driver: all through
+  MBRGPTNT's own 16-byte commands"). Where that path is not there
   (IDE / ATA disk drivers), the part out of reach is hatched, partitions
   reaching into it get no drive letter, the table is not rewritten (a GPT
   written there would describe only 2 TiB) and a blank disk is offered MBR
@@ -370,10 +397,11 @@ i386/               Windows NT 3.1, 3.5, 3.51, 4.0, 2000, XP (32-bit)
   mbrgunin.exe        uninstaller
   mgptpart.exe        command-line tool
   mgptgui.exe         graphical Disk / Partition Manager
+  mgptntfy.exe        drive-letter notifier for Explorer (NT 4.0 and later)
   nt31/ nt35/ nt40/   the same driver with subsystem 3.10 / 3.50 / 4.00 (optional)
 x64/                Windows XP x64 / Server 2003 x64
   mbrgptnt.sys        the x64 driver
-  mbrginst.exe  mbrgunin.exe  mgptpart.exe  mgptgui.exe   x64 builds of the tools
+  mbrginst.exe  mbrgunin.exe  mgptpart.exe  mgptgui.exe  mgptntfy.exe   x64 builds of the tools
 src/                driver and shared sources (one source for both architectures)
 tools/              build scripts, tool sources, the icon and its generator
 tests/              Linux test harnesses for the portable cores
@@ -385,8 +413,9 @@ docs/               screenshots
 On the target machine, from the `i386` folder (32-bit Windows) or the `x64`
 folder (x64 Windows), run `mbrginst` as an Administrator. It copies
 `mbrgptnt.sys` into `%SystemRoot%\System32\Drivers`, copies the tools
-(`mgptgui.exe`, `mgptpart.exe`, `mbrginst.exe`, `mbrgunin.exe`) into
-`%SystemRoot%\System32` so they are on the PATH, creates the service
+(`mgptgui.exe`, `mgptpart.exe`, `mbrginst.exe`, `mbrgunin.exe`,
+`mgptntfy.exe`) into `%SystemRoot%\System32` so they are on the PATH,
+creates the service
 `HKLM\SYSTEM\CurrentControlSet\Services\mbrgptnt` (kernel driver, system
 start), and adds the **MBRGPTNT** program group — a common group in
 Program Manager on NT 3.x, a Start menu folder on NT 4.0 and later — with
@@ -398,6 +427,10 @@ these items:
 | MBRGPTNT Command Line | a command prompt that shows `mgptpart`'s commands |
 | Uninstall MBRGPTNT | `mbrgunin.exe` |
 
+On NT 4.0 and later it also registers the drive-letter notifier
+(`mgptntfy.exe`) under
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run` and starts it.
+
 Reboot to load the driver. Installing over an earlier version works while
 that version runs: the files in use (its driver, a running manager) are
 replaced at the next restart.
@@ -405,7 +438,8 @@ replaced at the next restart.
 <img src="docs/program-group.png" alt="The MBRGPTNT program group on Windows NT 3.1" width="480">
 
 **Uninstalling.** *Uninstall MBRGPTNT* (or `mbrgunin`) asks for
-confirmation, then removes the program group, the service and the files;
+confirmation, then removes the program group, the service, the
+notifier's Run entry (ending the running notifier) and the files;
 the files in use are deleted at the next restart. The data on the disks is
 not touched — after the restart, GPT partitions and dynamic volumes that
 only MBRGPTNT can mount are simply no longer visible.
@@ -449,6 +483,9 @@ runs on NT 3.1 too), laid out like a modern disk manager:
 * **automatic refresh**: a disk plugged in or removed, or a change made by
   another program (for example `mgptpart`), shows up within about 2
   seconds, and the status bar says which disk was connected or removed.
+  **Refresh** (F5) on Windows 2000 / XP first scans for hardware changes,
+  so a disk plugged into a controller that does not announce it is found
+  too.
 
 Each operation opens its **own dialog** for its values: Create partition
 (FAT16 / FAT32 / NTFS / Extended / ... from a list - the exact type byte is
@@ -488,6 +525,7 @@ mgptpart active  <disk> <index> on|off   set/clear the active (boot) flag
 mgptpart letter  <disk> <index> <C-Z>    reassign a partition's drive letter
 mgptpart convert <disk> gpt|mbr          convert the table losslessly
 mgptpart rescan                     look for disks plugged in / removed now, then list
+                                    (2000 / XP: scans for hardware changes first)
 
 dynamic disks:
 mgptpart volumes                    disk groups, their disks (free space) and volumes
@@ -531,7 +569,8 @@ and `python3` with `pefile` (and Pillow, only to redraw the icon).
 
 ```
 tools/build.sh all          # driver: nt31 / nt35 / nt40 (i386) and x64
-tools/buildtools.sh         # i386 mgptpart.exe, mgptgui.exe, mbrginst.exe -> build/tools
+tools/buildtools.sh         # i386 mgptpart.exe, mgptgui.exe, mbrginst.exe, mbrgunin.exe,
+                            #   mgptntfy.exe -> build/tools
 tools/buildtools.sh x64     # x64 builds of the tools -> build/tools64
 python3 tools/mkicon.py tools/mgptnt.ico               # redraw the icons (16 VGA colors + 32-bit)
 python3 tools/mkicon.py tools/mgptcon.ico - console     #   badges: console, install, uninstall
@@ -629,6 +668,29 @@ Verified end to end under emulation:
   table is not rewritten over that partition's end.
 
   ![A 3 TiB GPT disk on Windows 2000: the whole disk in use through MBRGPTNT's own 16-byte commands](docs/large-disk-w2k.png)
+* **Disks plugged in while Windows runs (1.2)** — Windows 2000 with
+  AHCINT on the system disk: a GPT disk plugged in on USB got its volume
+  and drive letter, and an open My Computer window showed the letter at
+  once and dropped it when the disk was pulled (with the notifier ended,
+  the window kept the removed letter, as before). A GPT disk and a 3 TiB
+  GPT disk added to a running SCSI card (QEMU LSI 53C810, Windows' own
+  symc810 driver, which does not announce new disks) appeared only after
+  `mgptpart rescan` / Refresh in the manager, with their volumes and
+  letters. The 3 TiB disk, which Windows 2000 reports as 0 bytes there:
+  the Linux-written file on a FAT volume wholly past 2 TiB read,
+  `ntoskrnl.exe` copied onto it and onto a volume below 2 TiB, both
+  identical on the host and `fsck.fat` clean, `sgdisk -v` clean. NT 3.1:
+  the installer (no notifier there), `mgptpart rescan`, Refresh, and a
+  4 GB GPT IDE disk shown with its real size. Windows XP (32-bit, booted
+  from IDE, AHCINT 1.6 on the AHCI controller): a 3 TiB GPT disk with
+  volumes below and past 2 TiB mounted with letters ("the disk driver
+  reaches 1.9 TB; MBRGPTNT reaches the rest itself"), the file past 2 TiB
+  read; a GPT disk plugged in on USB appeared in an open My Computer
+  window and was dropped from it when pulled; the notifier started from
+  the Run key. Windows XP x64: the x64 installer, driver, notifier and
+  `mgptpart rescan` with a GPT disk plugged in on USB.
+
+  ![A 3 TiB disk added to a running SCSI card on Windows 2000, found by Refresh](docs/hotplug-w2k.png)
 * **Windows XP x64** — the x64 driver and tools: the NT 3.1-made mixed
   MBR / GPT group imported by Windows (simple, spanned and striped volumes
   healthy, files identical); MBRGPTNT showing the group as managed by
@@ -669,6 +731,8 @@ tools/mgptpart.c    command-line tool
 tools/mgptgui.c     graphical Disk / Partition Manager
 tools/mbrginst.c    installer
 tools/mbrgunin.c    uninstaller
+tools/mgptntfy.c    drive-letter notifier (tells Explorer about new / removed letters)
+tools/mgptbc.h      drive-letter broadcast and hardware rescan, shared by the tools
 tools/pmgroup.h     the program group (Program Manager DDE), shared by both
 tools/mkicon.py     draws the icons: the manager's (mgptnt.ico) and, with a badge,
                     the command line's (mgptcon.ico), the installer's

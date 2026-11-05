@@ -1,5 +1,60 @@
 # MBRGPTNT changelog
 
+## v1.2.0.0
+
+Disks plugged in while Windows runs (GitHub issue #1: an 8 TB e-SATA disk
+with one GPT NTFS partition on Windows XP 32-bit was found only when it was
+connected before start-up).
+
+- **A disk that is not ready when it shows up is read again.** A disk
+  plugged in while Windows runs can still be spinning up when the disk
+  driver creates its device, and a disk past 2 TiB may not answer READ
+  CAPACITY(16) or the read of its last sector yet. Before, the driver read
+  such a disk once on arrival: a table it could not read, or a disk past
+  2 TiB whose end did not answer, stayed without volumes (or with the part
+  past 2 TiB out of reach) until the next restart. Now the disk is read
+  again every 2 seconds for up to a minute, until its table and, past
+  2 TiB, its real size and end can be read; its volumes and drive letters
+  then appear. The same applies to disks that are slow at start-up.
+- **Refresh looks for new hardware** (Windows 2000 / XP). Many controller
+  drivers do not report a disk plugged in while Windows runs (e-SATA on
+  controllers in IDE mode, SCSI cards, controller drivers without hot-plug
+  support); Windows then sees the disk only after a restart or Device
+  Manager's "Scan for hardware changes". Refresh (F5) in the manager and
+  `mgptpart rescan` now start that scan themselves, wait for it, and then
+  have MBRGPTNT read the new disk, so the disk appears with its volumes and
+  drive letters. On NT 3.x / 4.0, whose disk drivers find disks only at
+  start-up, Refresh works as before.
+- **Explorer shows new and removed drive letters at once.** MBRGPTNT
+  creates and removes its drive letters in the kernel, where nothing tells
+  the shell; an open My Computer window kept showing a removed disk's
+  letter and did not show a new one until it was refreshed. A new
+  program, `mgptntfy.exe`, runs hidden in every logon session on NT 4.0
+  and later (started from the Run key; `mbrginst` registers and starts
+  it, `mbrgunin` ends and removes it), watches the driver's change counter
+  and sends the volume arrival / removal messages for the letters that
+  came or went. The manager and `mgptpart` send them too after every
+  change they make.
+- **Disks past 2 TiB that Windows 2000 reports as 0 bytes are used
+  whole.** Behind a controller driver that answers READ CAPACITY(10) with
+  FFFFFFFFh (SCSI cards, USB), Windows 2000's disk driver reports no size
+  at all. MBRGPTNT took the device's real size from READ CAPACITY(16) but
+  showed the disk read-only with no volumes; now every sector past the
+  first goes through its own READ(16) / WRITE(16), as on a disk the driver
+  reaches up to 2 TiB, and its volumes get drive letters. The disk row says
+  "no size from the disk driver: all through MBRGPTNT's own 16-byte
+  commands".
+- **NT 3.1: IDE disks larger than about 500 MB had a wrong size.** NT
+  3.1's IDE disk driver (atdisk) reports a disk whose BIOS geometry has
+  255 heads with 65535 heads, so a 4 GB disk showed as 1.0 TB and an 8 GB
+  one as 1.9 TB. On such a GPT disk a new table would have placed its
+  backup copy at a sector that does not exist (atdisk wraps it onto
+  another one). The geometry is taken with at most 255 heads now. A
+  request the disk driver does not know (the disk-length request on NT
+  3.x) is no longer taken as answered when the driver only reports
+  success.
+- Version information (1.2.0.0) in the driver and every tool.
+
 ## v1.1.0.0
 
 - The installer adds an **MBRGPTNT** program group: Disk / Partition

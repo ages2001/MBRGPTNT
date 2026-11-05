@@ -41,6 +41,9 @@ __declspec(dllimport) DWORD __stdcall GetVersion(void);
 
 #include "../src/mgptioc.h"
 #include "../src/gptcore.h"   /* GPT_FS_* kinds and their names */
+__declspec(dllimport) DWORD __stdcall GetLogicalDrives(void);
+__declspec(dllimport) void * __stdcall GetProcAddress(void *,LPCSTR);
+#include "mgptbc.h"           /* drive-letter broadcast, hardware rescan */
 
 static HANDLE g_out;
 static DWORD slen(const char*s){DWORD n=0;while(s[n])n++;return n;}
@@ -115,7 +118,8 @@ static void cmd_show(HANDLE h,DWORD disk){
     else{outs("Disk ");outdec(disk);outs((lay.Reach&MGPT_R_WHOLE)?"  (no partition table)":lay.Dynamic?(lay.IsGpt?"  (dynamic, GPT)":"  (dynamic, MBR)"):lay.IsGpt?"  (GPT)":"  (MBR)");}
     outs("  sector=");outdec(lay.SectorSize);outs("  sectors=");outdec(lay.TotalSectors);outs("  (");outsize(lay.TotalSectors,lay.SectorSize);outs(")\r\n");
     if((lay.Reach&MGPT_R_WHOLE)&&!lay.Media)outs("one file system covers the whole disk (shown only)\r\n");
-    if(lay.Reach&MGPT_R_EXTENDED){outs("the disk driver reaches ");outsize(lay.DriverSectors,lay.SectorSize);outs("; MBRGPTNT reaches the rest itself (16-byte commands)\r\n");}
+    if(lay.Reach&MGPT_R_EXTENDED){if(lay.DriverSectors<=1)outs("the disk driver reports no size for this disk; MBRGPTNT reaches all of it itself (16-byte commands)\r\n");
+        else{outs("the disk driver reaches ");outsize(lay.DriverSectors,lay.SectorSize);outs("; MBRGPTNT reaches the rest itself (16-byte commands)\r\n");}}
     else if(lay.DeviceSectors>lay.TotalSectors&&lay.TotalSectors){outs("the disk is ");outsize(lay.DeviceSectors,lay.SectorSize);outs("; this Windows reaches only the first ");outsize(lay.TotalSectors,lay.SectorSize);outs(" of it\r\n");}
     else if(lay.TotalSectors==0&&(lay.Reach&MGPT_R_CAPPED)){outs("the disk driver of this Windows release reports no size for this disk (past its 2 TiB limit)");
         if(lay.Reach&MGPT_R_TABLE){outs("; the disk is ");outsize(lay.TableSectors,lay.SectorSize);}outs(" - shown read-only\r\n");}
@@ -346,16 +350,17 @@ void __stdcall MgptMain(void){
         outs("  create <disk> fat16|fat32|ntfs|ext|<type-hex> [size: 500, 750GB, 2TB ...]\r\n  delete <disk> <index>\r\n");
         outs("  settype <disk> <index> <type-hex>\r\n  active <disk> <index> on|off\r\n");
         outs("  letter <disk> <index> <C-Z>\r\n  convert <disk> gpt|mbr\r\n");
-        outs("  rescan   (look for disks plugged in or removed now, then list)\r\n");
+        outs("  rescan   (look for disks plugged in or removed now, then list;\r\n");
+        outs("           2000 / XP: also scans for hardware changes first)\r\n");
         outs("dynamic disks:\r\n  volumes\r\n  dynamic <disk>   basic <disk>\r\n");
         outs("  vcreate simple|spanned|striped|mirror|raid5 <MB> <disk>[:<MB>] ...\r\n");
         outs("           (MB per disk, 0 = as large as possible)\r\n");
         outs("  vdelete <volume|X:>\r\n  vletter <volume|X:> <C-Z|none>\r\n");
         ExitProcess(0);
     }
-    h=open_drv();
+    h=open_drv(); mgDrivesInit();
     if(streq(g_args[0],"list"))cmd_list(h);
-    else if(streq(g_args[0],"rescan")){ DWORD gen,ret; DeviceIoControl(h,IOCTL_MGPT_RESCAN,NULL,0,&gen,sizeof(gen),&ret,NULL); cmd_list(h); }
+    else if(streq(g_args[0],"rescan")){ DWORD gen,ret; mgHardwareRescan(); DeviceIoControl(h,IOCTL_MGPT_RESCAN,NULL,0,&gen,sizeof(gen),&ret,NULL); cmd_list(h); }
     else if(streq(g_args[0],"show")&&g_nargs>=2)cmd_show(h,diskarg(g_args[1]));
     else if(streq(g_args[0],"init")&&g_nargs>=3)cmd_init(h,atou(g_args[1]),streq(g_args[2],"gpt"));
     else if(streq(g_args[0],"create")&&g_nargs>=3)cmd_create(h,atou(g_args[1]),parse_type(g_args[2]),g_nargs>=4?parse_size(g_args[3]):0);
@@ -371,5 +376,6 @@ void __stdcall MgptMain(void){
     else if(streq(g_args[0],"vdelete")&&g_nargs>=2)cmd_vreq(h,IOCTL_MGPT_LDMDELETE,g_args[1],NULL);
     else if(streq(g_args[0],"vletter")&&g_nargs>=3)cmd_vreq(h,IOCTL_MGPT_LDMLETTER,g_args[1],g_args[2]);
     else outs("bad command\r\n");
+    mgDrivesChanged();            /* letters this command added or removed */
     CloseHandle(h); ExitProcess(0);
 }

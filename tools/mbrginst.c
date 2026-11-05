@@ -36,6 +36,10 @@ __declspec(dllimport) DWORD __stdcall GetModuleFileNameA(HANDLE,LPSTR,DWORD);
 __declspec(dllimport) DWORD __stdcall GetWindowsDirectoryA(LPSTR,DWORD);
 __declspec(dllimport) BOOL  __stdcall CopyFileA(LPCSTR,LPCSTR,BOOL);
 __declspec(dllimport) BOOL  __stdcall MoveFileExA(LPCSTR,LPCSTR,DWORD);
+__declspec(dllimport) DWORD __stdcall GetVersion(void);
+__declspec(dllimport) unsigned int __stdcall WinExec(LPCSTR,unsigned int);
+#define REG_SZ 1
+#define SW_HIDE 0
 #define MOVEFILE_REPLACE_EXISTING   1
 #define MOVEFILE_DELAY_UNTIL_REBOOT 4
 
@@ -65,7 +69,7 @@ static const char SvcKey[]="SYSTEM\\CurrentControlSet\\Services\\mbrgptnt";
 void __stdcall MbrgInstEntry(void){
     char exe[MAX_PATH],dir[MAX_PATH],src[MAX_PATH],dst[MAX_PATH],win[MAX_PATH];
     DWORD n,i,cut; HKEY hk; DWORD disp,dw; long rc;
-    static const char *tools[]={"mgptgui.exe","mgptpart.exe","mbrginst.exe","mbrgunin.exe"};
+    static const char *tools[]={"mgptgui.exe","mgptpart.exe","mbrginst.exe","mbrgunin.exe","mgptntfy.exe"};
     g_out=GetStdHandle(STD_OUTPUT_HANDLE);
     n=GetModuleFileNameA(NULL,exe,MAX_PATH);
     scopy(dir,exe);cut=0;for(i=0;i<n;i++)if(dir[i]=='\\')cut=i;dir[cut+1]=0;
@@ -78,7 +82,7 @@ void __stdcall MbrgInstEntry(void){
     case 2: outs("  the driver in use is replaced at the next restart\r\n");break;
     }
     /* tools (GUI, console, this installer) -> System32 so they are on PATH */
-    for(i=0;i<4;i++){
+    for(i=0;i<5;i++){
         scopy(src,dir);scat(src,(char*)tools[i]);
         scopy(dst,win);scat(dst,"\\System32\\");scat(dst,(char*)tools[i]);
         switch(Install(src,dst)){
@@ -92,6 +96,18 @@ void __stdcall MbrgInstEntry(void){
     dw=1;RegSetValueExA(hk,"Start",0,REG_DWORD,(const BYTE*)&dw,4);
     dw=1;RegSetValueExA(hk,"ErrorControl",0,REG_DWORD,(const BYTE*)&dw,4);
     RegCloseKey(hk);
+    /* NT 4.0 and later: the drive-letter notifier runs in every logon
+       session, so Explorer shows the letters of disks plugged in while
+       Windows runs (NT 3.x has no Explorer and no Run key) */
+    if((GetVersion()&0xFF)>=4){
+        scopy(dst,win);scat(dst,"\\System32\\mgptntfy.exe");
+        if(RegCreateKeyExA(HKEY_LOCAL_MACHINE,"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",0,NULL,0,KEY_ALL_ACCESS,NULL,&hk,&disp)==ERROR_SUCCESS){
+            RegSetValueExA(hk,"MBRGPTNT",0,REG_SZ,(const BYTE*)dst,slen(dst)+1);
+            RegCloseKey(hk);
+            outs("  the drive-letter notifier starts at every logon\r\n");
+        }
+        WinExec(dst,SW_HIDE);   /* now as well (ends at once if already running) */
+    }
     /* the MBRGPTNT program group: the manager, the command line, uninstall */
     {
         PMCONN pm; char sys[MAX_PATH];

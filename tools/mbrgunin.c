@@ -40,6 +40,10 @@ __declspec(dllimport) DWORD __stdcall GetWindowsDirectoryA(LPSTR,DWORD);
 __declspec(dllimport) BOOL  __stdcall DeleteFileA(LPCSTR);
 __declspec(dllimport) BOOL  __stdcall MoveFileExA(LPCSTR,LPCSTR,DWORD);
 __declspec(dllimport) int   __stdcall MessageBoxA(HWND,LPCSTR,LPCSTR,unsigned int);
+__declspec(dllimport) long  __stdcall RegDeleteValueA(HKEY,LPCSTR);
+__declspec(dllimport) HWND  __stdcall FindWindowA(LPCSTR,LPCSTR);
+__declspec(dllimport) BOOL  __stdcall PostMessageA(HWND,unsigned int,ULONG_PTR,LONG_PTR);
+__declspec(dllimport) void  __stdcall Sleep(DWORD);
 
 #define PM_REMOVE_ONLY
 #include "pmgroup.h"
@@ -69,7 +73,7 @@ static int Remove(const char *path)
 
 void __stdcall MbrgUninEntry(void)
 {
-    static const char *tools[] = { "mgptgui.exe", "mgptpart.exe", "mbrginst.exe", "mbrgunin.exe" };
+    static const char *tools[] = { "mgptgui.exe", "mgptpart.exe", "mbrginst.exe", "mbrgunin.exe", "mgptntfy.exe" };
     char win[MAX_PATH], path[MAX_PATH]; int later = 0, i; long rc; PMCONN pm;
     if (MessageBoxA(NULL,
             "Remove MBRGPTNT from this computer?\n\n"
@@ -84,10 +88,22 @@ void __stdcall MbrgUninEntry(void)
 
     rc = DeleteTree(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\mbrgptnt");
 
+    /* the drive-letter notifier: no longer started at logon, and ended in
+       this session so its file can be deleted */
+    {
+        HKEY k; HWND w;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_ALL_ACCESS, &k) == ERROR_SUCCESS) {
+            RegDeleteValueA(k, "MBRGPTNT");
+            RegCloseKey(k);
+        }
+        w = FindWindowA("MbrGptNtNotify", NULL);
+        if (w) { PostMessageA(w, 0x0010 /* WM_CLOSE */, 0, 0); Sleep(500); }
+    }
+
     GetWindowsDirectoryA(win, MAX_PATH);
     scopy(path, win); scat(path, "\\System32\\Drivers\\mbrgptnt.sys");
     later |= Remove(path);
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         scopy(path, win); scat(path, "\\System32\\"); scat(path, tools[i]);
         later |= Remove(path);
     }

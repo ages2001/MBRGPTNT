@@ -102,6 +102,18 @@ static NTSTATUS SyncIoctl(ULONG Code, PDEVICE_OBJECT Device, PVOID In, ULONG InL
     return st;
 }
 
+/* The disk's geometry. NT 3.1's atdisk reports a translated IDE disk (one
+   whose BIOS geometry has 255 heads) with 65535 heads, which makes it
+   256 times its size: no disk has more than 255 heads. */
+static NTSTATUS DiskGeometry(PDEVICE_OBJECT part0, DISK_GEOMETRY *geo)
+{
+    NTSTATUS st;
+    memset(geo, 0, sizeof(*geo));
+    st = SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, part0, NULL, 0, geo, sizeof(*geo));
+    if (NT_SUCCESS(st) && geo->TracksPerCylinder > 255) geo->TracksPerCylinder = 255;
+    return st;
+}
+
 /* ---- past 2 TiB on releases whose disk driver stops there ----------
    NT 3.x - XP i386 read and write disks with READ(10) / WRITE(10), whose
    32-bit sector numbers end at 2 TiB (with 512-byte sectors). The device
@@ -434,16 +446,16 @@ static UCHAR AssignDriveLetter(const char *DeviceName)
     return 0;
 }
 
-static void PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNumber, GPT_PARTITION *P, ULONG Bps, gpt_u64 BigFromLba)
+static int PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNumber, GPT_PARTITION *P, ULONG Bps, gpt_u64 BigFromLba)
 {
     char name[48]; UNICODE_STRING uname; PDEVICE_OBJECT dev, p0dev; PFILE_OBJECT p0file; PPART_EXT ext; NTSTATUS st;
     (void)Part0;
     sprintf(name, "\\Device\\Harddisk%lu\\Partition%lu", (unsigned long)DiskNumber, (unsigned long)PartNumber);
-    if (!NT_SUCCESS(MakeUnicode(name, &uname))) return;
+    if (!NT_SUCCESS(MakeUnicode(name, &uname))) return 0;
     st = IoCreateDevice(g_Driver, sizeof(PART_EXT), &uname, FILE_DEVICE_DISK, 0, FALSE, &dev);
     RtlFreeUnicodeString(&uname);
-    if (!NT_SUCCESS(st)) { D("  create "); D(name); D(" failed st="); DH(st); D("\n"); return; }
-    if (!NT_SUCCESS(OpenPartition0(DiskNumber, &p0file, &p0dev))) { IoDeleteDevice(dev); return; }
+    if (!NT_SUCCESS(st)) { D("  create "); D(name); D(" failed st="); DH(st); D("\n"); return 0; }
+    if (!NT_SUCCESS(OpenPartition0(DiskNumber, &p0file, &p0dev))) { IoDeleteDevice(dev); return 0; }
     ext = (PPART_EXT)dev->DeviceExtension;
     ext->Kind = KIND_PART; ext->Self = dev; ext->LowerDevice = p0dev; ext->LowerFile = p0file;
     ext->StartingOffset.QuadPart = (gpt_u64)P->StartLba * (gpt_u64)Bps;
@@ -461,6 +473,7 @@ static void PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartN
         ext->DriveLetter = AssignDriveLetter(name);
     LockList(); ext->Next = g_PartList; g_PartList = ext; UnlockList();
     D("  "); D(name); D(" type="); DH(P->MbrType); D(" letter="); DH(ext->DriveLetter); D("\n");
+    return 1;
 }
 
 /* First \Device\HarddiskN\PartitionM name not taken by any device. A name
@@ -503,9 +516,13 @@ static gpt_u64 DiskReach(PDEVICE_OBJECT part0, DISK_GEOMETRY *geo, int Verify)
     gpt_u64 total = (gpt_u64)geo->Cylinders.QuadPart * (gpt_u64)geo->TracksPerCylinder * (gpt_u64)geo->SectorsPerTrack;
     gpt_u64 len = 0; ULONG bps = geo->BytesPerSector; int sh = 0; LARGE_INTEGER l; PARTITION_INFORMATION pi;
     while (sh < 16 && (1UL << sh) < bps) sh++;
-    if (NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_LENGTH_INFO_, part0, NULL, 0, &l, sizeof(l))))
+    /* NT 3.x's atdisk completes requests it does not know (GET_LENGTH_INFO)
+       with success and leaves the buffer as it was: start from zero and
+       take an answer only when it is one */
+    l.QuadPart = 0; memset(&pi, 0, sizeof(pi));
+    if (NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_LENGTH_INFO_, part0, NULL, 0, &l, sizeof(l))) && l.QuadPart > 0)
         len = (gpt_u64)l.QuadPart >> sh;
-    else if (NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_PARTITION_INFO, part0, NULL, 0, &pi, sizeof(pi))))
+    else if (NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_PARTITION_INFO, part0, NULL, 0, &pi, sizeof(pi))) && pi.PartitionLength.QuadPart > 0)
         len = (gpt_u64)pi.PartitionLength.QuadPart >> sh;
     if (len > total) {
         UCHAR *buf; LARGE_INTEGER off;
@@ -595,11 +612,18 @@ static gpt_u64 DeviceSize(PDEVICE_OBJECT part0, ULONG bps)
    it (0 = it does not), for tables built from scratch (initialize,
    convert), which do not come from ParseDisk */
 static gpt_u64 g_drvSect[64];
+/* per disk: the last ParseDisk could not read all it needed - the table,
+   or (at the 2 TiB limit) the device's own size and last sector. A disk
+   plugged in while Windows runs (e-SATA, USB) can still be spinning up or
+   settling when it first shows; the disk check reads it again (see
+   CheckDisks). */
+static UCHAR g_unsettled[64];
 static ULONG ParseDisk(ULONG DiskNumber, GPT_DISK *disk)
 {
     PFILE_OBJECT file; PDEVICE_OBJECT part0; DISK_GEOMETRY geo; ENUMCTX ctx; ULONG bps; gpt_u64 total, dev, big = 0; NTSTATUS st;
+    if (DiskNumber < MGPT_MAXDISK) g_unsettled[DiskNumber] = 1;
     if (!NT_SUCCESS(OpenPartition0(DiskNumber, &file, &part0))) return 0;
-    st = SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, part0, NULL, 0, &geo, sizeof(geo));
+    st = DiskGeometry(part0, &geo);
     if (!NT_SUCCESS(st)) { ObDereferenceObject(file); return 0; }
     bps = geo.BytesPerSector;
     if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) { ObDereferenceObject(file); return 0; }
@@ -608,13 +632,21 @@ static ULONG ParseDisk(ULONG DiskNumber, GPT_DISK *disk)
     /* stopped at the 2 TiB limit: what is the device's real size, and can
        MBRGPTNT reach it itself? */
     dev = NearCap(total) ? DeviceSize(part0, bps) : 0;
-    if (dev > total + GPT_REACH_SLACK_ && total && BigReachable(part0, dev, bps)) { ctx.BigFrom = total; big = total; total = dev; }
+    /* A disk driver that reports no size at all (Windows 2000 adds one to
+       a last sector of FFFFFFFFh in 32 bits) still reads the first
+       sectors; there everything past the MBR sector goes through BigIo. */
+    if (dev > total + GPT_REACH_SLACK_ && BigReachable(part0, dev, bps)) { big = total ? total : 1; ctx.BigFrom = big; total = dev; }
     st = GptParse(EnumRead, &ctx, bps, total, disk);
     if (st == GPT_OK) {
         disk->DiskSectors = big ? total : ProbeEnd(&ctx, disk, total);
         disk->DeviceSectors = dev;
         disk->DriverSectors = big;
-        if (DiskNumber < MGPT_MAXDISK) g_drvSect[DiskNumber] = big;
+        if (DiskNumber < MGPT_MAXDISK) {
+            g_drvSect[DiskNumber] = big;
+            /* settled unless the disk stops at the limit and its own size
+               is unknown, or larger and its end could not be read yet */
+            g_unsettled[DiskNumber] = (UCHAR)(!big && NearCap(total) && (dev == 0 || dev > total + GPT_REACH_SLACK_));
+        }
     }
     ObDereferenceObject(file);
     if (st != GPT_OK) return 0;
@@ -710,6 +742,7 @@ static int ParseCd(ULONG n, GPT_DISK *disk, int *media)
     RtlFreeUnicodeString(&un);
     memset(disk, 0, sizeof(*disk));
     disk->SectorSize = 2048; disk->Whole = 1;
+    memset(&geo, 0, sizeof(geo));
     if (NT_SUCCESS(SyncIoctl(IOCTL_CDROM_GET_DRIVE_GEOMETRY_, dev, NULL, 0, &geo, sizeof(geo))) ||
         NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, dev, NULL, 0, &geo, sizeof(geo)))) {
         total = (gpt_u64)geo.Cylinders.QuadPart * (gpt_u64)geo.TracksPerCylinder * (gpt_u64)geo.SectorsPerTrack;
@@ -1259,14 +1292,14 @@ static int WantVolume(ULONG dn, const GPT_DISK *disk, GPT_PARTITION *g, ULONG bp
    ClassServes) - including partitions created since start-up, which the
    class driver only sees after a restart. A class volume whose partition
    was deleted loses its drive letter at once when it is not in use. */
-static void SyncDisk(ULONG DiskNumber)
+static int SyncDisk(ULONG DiskNumber)
 {
-    GPT_DISK *disk; ULONG bps, i; int owned, classDisk;
+    GPT_DISK *disk; ULONG bps, i; int owned, classDisk, added = 0;
     PPART_EXT p;
     PFILE_OBJECT file; PDEVICE_OBJECT part0;
 
     disk = (GPT_DISK *)ExAllocatePool(NonPagedPool, sizeof(GPT_DISK));
-    if (!disk) return;
+    if (!disk) return 0;
     KeWaitForSingleObject(&g_SyncLock, Executive, KernelMode, FALSE, NULL);
     BuildClassView();
     bps = ParseDisk(DiskNumber, disk);
@@ -1341,12 +1374,13 @@ static void SyncDisk(ULONG DiskNumber)
             for (p = g_PartList; p; p = p->Next)
                 if (p->DiskNumber == DiskNumber && !p->Stale && (gpt_u64)p->StartingOffset.QuadPart == off) { have = 1; break; }
             UnlockList();
-            if (!have) PublishPartition(part0, DiskNumber, FirstFreePartitionIndex(DiskNumber), g, bps, disk->DriverSectors);
+            if (!have) added += PublishPartition(part0, DiskNumber, FirstFreePartitionIndex(DiskNumber), g, bps, disk->DriverSectors);
         }
         ObDereferenceObject(file);
     }
     KeSetEvent(&g_SyncLock, 0, FALSE);
     ExFreePool(disk);
+    return added;
 }
 
 /* ---- dynamic disks (LDM) ---------------------------------------------
@@ -1889,7 +1923,7 @@ static int ProbeDisk(ULONG d, DISKID *id)
     PFILE_OBJECT file; PDEVICE_OBJECT part0; DISK_GEOMETRY geo; NTSTATUS st; ULONG bps;
     id->present = 0; id->bps = 0; id->removable = 0; id->ident = 0; id->total = 0;
     if (!NT_SUCCESS(OpenPartition0(d, &file, &part0))) return 0;
-    st = SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, part0, NULL, 0, &geo, sizeof(geo));
+    st = DiskGeometry(part0, &geo);
     bps = geo.BytesPerSector;
     if (!NT_SUCCESS(st) || (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096)) { ObDereferenceObject(file); return 0; }
     id->bps = bps;
@@ -1974,6 +2008,13 @@ static int SweepStale(void)
     return changed;
 }
 
+/* A disk that is not fully readable when it shows up - still spinning up
+   after being plugged in, or a disk past 2 TiB whose READ CAPACITY(16) /
+   last sector does not answer yet - is read again on every pass for a
+   while (DISK_RETRIES passes of 2 s), until its volumes are published. */
+#define DISK_RETRIES 30
+static UCHAR g_retry[MGPT_MAXDISK];
+
 /* One pass over all disks. Runs in the disk-check system thread. */
 static void CheckDisks(void)
 {
@@ -1984,11 +2025,20 @@ static void CheckDisks(void)
         DISKID *k = &g_known[d];
         ProbeDisk(d, &id);
         if (!id.present && !k->present) continue;
-        if (id.present && k->present && SameDisk(&id, k)) continue;
+        if (id.present && k->present && SameDisk(&id, k)) {
+            /* read again a disk that came up only partly readable */
+            if (g_retry[d] && g_unsettled[d]) {
+                g_retry[d]--;
+                D("disk "); DH(d); D(" read again\n");
+                if (SyncDisk(d)) changed = 1;
+            } else g_retry[d] = 0;
+            continue;
+        }
         D("disk "); DH(d); D(id.present ? (k->present ? " swapped\n" : " arrived\n") : " removed\n");
         if (k->present) DropDisk(d);
         *k = id;
-        if (id.present) SyncDisk(d);
+        g_retry[d] = 0;
+        if (id.present) { SyncDisk(d); g_retry[d] = DISK_RETRIES; }
         changed = 1;
     }
     if (g_LdmDirty) changed = 1;
@@ -2062,7 +2112,7 @@ static NTSTATUS WriteAndReenumLocked(ULONG DiskNumber, GPT_DISK *disk)
     if (!disk->Heads) {
         /* a freshly initialized table: take the CHS geometry from the disk */
         DISK_GEOMETRY geo;
-        if (NT_SUCCESS(SyncIoctl(IOCTL_DISK_GET_DRIVE_GEOMETRY, part0, NULL, 0, &geo, sizeof(geo)))) {
+        if (NT_SUCCESS(DiskGeometry(part0, &geo))) {
             disk->Heads = geo.TracksPerCylinder; disk->SectorsPerTrack = geo.SectorsPerTrack;
         }
     }
