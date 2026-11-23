@@ -1,6 +1,6 @@
 # MBRGPTNT changelog
 
-## v1.2.0.0
+## v1.2
 
 Disks plugged in while Windows runs (GitHub issue #1: an 8 TB e-SATA disk
 with one GPT NTFS partition on Windows XP 32-bit was found only when it was
@@ -121,9 +121,16 @@ connected before start-up).
   request the disk driver does not know (the disk-length request on NT
   3.x) is no longer taken as answered when the driver only reports
   success.
-- Version information (1.2.0.0) in the driver and every tool.
+- Version information (1.2) in the driver and every tool.
+- **Licence: GPL-2.0.** `LICENSE` now holds the GNU GPL version 2 (it held
+  version 3); the README has a Licence section.
+- **Windows (CRLF) line endings** for every text file (sources, headers,
+  resource scripts, the INF, the docs, LICENSE); only the `*.sh` / `*.py`
+  build scripts stay LF. `.gitattributes` keeps them that way in every
+  checkout on every platform (the INF is stored byte-for-byte) and
+  `.gitignore` keeps `build/` and other build output out of the repository.
 
-## v1.1.0.0
+## v1.1
 
 - The installer adds an **MBRGPTNT** program group: Disk / Partition
   Manager, MBRGPTNT Command Line (a command prompt showing `mgptpart`'s
@@ -225,9 +232,9 @@ connected before start-up).
     after the number (`750GB`, `2TB`; MB when there is none).
   - The New partition dialog says how large the free area is when the
     size entered does not fit, instead of a general failure message.
-- Version information (1.1.0.0) in the driver and every tool.
+- Version information (1.1) in the driver and every tool.
 
-## v1.0.0.0
+## v1.0
 
 First release. MBR, GPT and dynamic disk (LDM) driver and tools for
 Windows NT 3.1, 3.5, 3.51, 4.0, 2000 and XP, as i386 and x64 binaries built

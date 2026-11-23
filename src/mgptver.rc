@@ -21,12 +21,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "ages2001"
             VALUE "FileDescription", MG_DESC
-            VALUE "FileVersion", "1.2.0.0"
+            VALUE "FileVersion", "1.2"
             VALUE "InternalName", MG_NAME
             VALUE "LegalCopyright", "Copyright (C) 2026 ages2001"
             VALUE "OriginalFilename", MG_NAME
             VALUE "ProductName", "MBRGPTNT"
-            VALUE "ProductVersion", "1.2.0.0"
+            VALUE "ProductVersion", "1.2"
         END
     END
     BLOCK "VarFileInfo"

@@ -756,3 +756,12 @@ tools/mkicon.py     draws the icons: the manager's (mgptnt.ico) and, with a badg
                     the command line's (mgptcon.ico), the installer's
                     (mgptins.ico) and the uninstaller's (mgptuni.ico)
 ```
+
+## Licence
+
+MBRGPTNT is licensed under the GNU General Public License, version 2
+(GPL-2.0); see `LICENSE`. Copyright (C) 2026 ages2001.
+
+All text files use Windows CRLF line endings; `.gitattributes` keeps them so
+in every checkout (Linux included), and `.gitignore` keeps build output out
+of the repository.
