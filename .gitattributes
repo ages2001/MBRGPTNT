@@ -1,0 +1,36 @@
+# Line endings: MBRGPTNT is a Windows NT tool. Its text files (sources, docs,
+# the INF) use Windows CRLF line endings in the repository and in every
+# checkout, on every platform and with any core.autocrlf setting, so Linux
+# users get exactly the same files. Only the Unix build scripts stay LF.
+
+* text=auto eol=crlf
+
+# Unix-only scripts: LF, or bash/python cannot run them
+*.sh        text eol=lf
+*.py        text eol=lf
+
+# Windows configuration files: stored byte-for-byte (CRLF), no conversion,
+# so they are CRLF everywhere - checkouts, archives and raw downloads alike
+*.inf       -text
+*.ini       -text
+*.reg       -text
+*.txt       -text
+*.bat       -text
+*.cmd       -text
+
+# Sources and docs: CRLF in every checkout
+*.c         text eol=crlf
+*.h         text eol=crlf
+*.rc        text eol=crlf
+*.def       text eol=crlf
+*.md        text eol=crlf
+LICENSE     text eol=crlf
+
+# Binaries: never touched
+*.sys       binary
+*.exe       binary
+*.ico       binary
+*.png       binary
+*.lib       binary
+*.obj       binary
+*.res       binary

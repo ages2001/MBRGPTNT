@@ -1,0 +1,24 @@
+# Build output (tools/build.sh, tools/buildtools.sh); the release binaries
+# are copied to i386/ and x64/, which are kept
+/build/
+*.obj
+*.o
+*.res
+*.lib
+*.def
+
+# Test disk images
+*.img
+*.raw
+*.vhd
+*.vhdx
+*.vdi
+*.vmdk
+*.qcow2
+
+# Editor and OS leftovers
+*~
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,6 +1,92 @@
 # MBRGPTNT changelog
 
-## v1.2.0.0
+## v1.3
+
+Pure-GPT system and paging volumes on every NT version, boot-start loading,
+full PnP on Windows 2000 and later, and drive letters that survive a restart
+or a disk switched off and on again.
+
+- **Drive letters are now kept across restarts** (GitHub issue #3: on
+  Windows 2000 a letter the user picked was lost on the next boot). Because
+  the volumes this driver publishes are not PnP volumes, the Mount Manager
+  does not persist their letters, so each boot handed out the first free
+  letter again. MBRGPTNT now remembers the letter itself, keyed by a stable
+  volume id - the GPT partition GUID, or the MBR disk signature plus the
+  partition start LBA - under its own service key
+  `HKLM\System\CurrentControlSet\Services\<driver>\Letters` (one value per
+  volume). On start-up the stored letter is reused when it is free, a newly
+  assigned letter is written back, and a letter the user changes at run time
+  is captured on the next disk-check pass and persisted too. Applies to
+  basic MBR/GPT volumes and to dynamic (LDM) volumes.
+- **Pure-GPT paging file now works, and the Mount Manager owns the letters of
+  fixed volumes.** On NT5+ (2000/XP) a legacy driver's volumes were invisible
+  to the Mount Manager, so the Memory Manager refused them a paging file -
+  pure GPT then showed XP's "Limited Virtual Memory" warning. Each **fixed**
+  volume is now made Mount-Manager-aware the non-PnP way: it answers the
+  MOUNTDEV query set (`IOCTL_MOUNTDEV_QUERY_UNIQUE_ID` / `_DEVICE_NAME` /
+  `_STABLE_GUID` / `_SUGGESTED_LINK_NAME`) and posts a volume-arrival
+  notification to `\Device\MountPointManager`. The Mount Manager then
+  enumerates the volume, assigns and persists its drive letter natively (so
+  issue #3 is handled by the OS on these systems, with the driver's own
+  `\Letters` store as the suggested letter and the fallback where there is no
+  Mount Manager - NT 3.x/4.0), and the paging file can be created on a pure-GPT
+  volume. **Removable / hot-plug** volumes are not handed over: they keep the
+  driver's own letter management so on-the-fly removal (issue #2) stays
+  reliable, and a removable disk is never a paging target anyway.
+- **Boot-start driver on every OS.** The installer now registers MBRGPTNT
+  with `Start = 0` (`SERVICE_BOOT_START`, group *Boot Bus Extender*) on all
+  targets, so the driver loads at boot and its MBR/GPT volumes - including a
+  pure-GPT system or paging volume - exist before the session manager
+  activates the paging file. `ErrorControl` stays *Normal*, so a load
+  failure is logged and boot continues; `DriverEntry` does no disk work
+  (enumeration is deferred to a worker thread), so early load order is safe.
+  The service is left ungrouped, so it initialises after every named group
+  (i.e. after the disk stack) on NT 3.1 - XP alike. The enumerator now runs
+  its **first pass immediately** (no up-front delay) and polls fast until the
+  first volume appears, so a pure-GPT system or paging volume is lettered
+  before the session manager creates the paging file. This matters most on
+  NT 3.x/4.0, where there is no PnP or Mount Manager to retry: the driver's
+  own persistent drive-letter assignment plus straight pass-through of paging
+  reads/writes gives a working page file on a pure-GPT disk with no PnP at all.
+- **Full PnP on Windows 2000 and later (new 2000/XP 32-bit build).** In
+  addition to the non-PnP Mount-Manager path above, the NT5+ builds are a
+  real PnP **bus driver**. The installer registers a root-enumerated device
+  (`Root\mbrgptnt`, or install `mbrgptnt.inf`), the PnP manager calls the
+  driver's `AddDevice`, and each live volume is reported as a child **PDO**
+  that answers `QUERY_ID` / `QUERY_CAPABILITIES` (`RawDeviceOK`,
+  `SurpriseRemovalOK`) / `QUERY_DEVICE_TEXT` and exposes
+  `GUID_DEVINTERFACE_VOLUME`. That device interface is exactly what the
+  Mount Manager watches, so on these systems the volumes behave as native
+  PnP volumes - Device Manager presence, persistent `\??\Volume{GUID}`
+  names, drive letters and pure-GPT paging - with clean arrival/removal via
+  `IRP_MN_QUERY_DEVICE_RELATIONS`/`REMOVE_DEVICE` instead of polling. The
+  driver is split by OS: `nt31`/`nt35`/`nt40` are the unchanged legacy boot
+  drivers (no PnP imports, so they load on systems with no PnP manager),
+  while `nt50` (2000/XP/2003 x86) and `x64` (XP x64/2003 x64) add the PnP
+  bus. NT 3.x/4.0 keep the driver's own letter management and the legacy
+  Mount-Manager notification.
+- **A powered-off external disk is noticed and re-detected** (GitHub issue
+  #2: an external e-SATA disk was connected on the fly only the first time;
+  after switching it off and on again it was no longer found). A fixed
+  external disk keeps its device object when switched off and answers its
+  geometry from cache, so a geometry-only check never saw it go away and so
+  never re-detected it. The disk-check pass now reads sector 0 of every disk
+  (not only removable media), so a disk that is off is seen as gone and is
+  published again when it returns; the signature read there also catches a
+  disk swapped for another.
+- **Disk / Partition Manager** (`mgptgui`): dead code removed; checked on
+  MBR and GPT disks with every supported file system.
+- Version information (1.3) in the driver and every tool.
+- **Licence: GPL-2.0.** `LICENSE` now holds the GNU GPL version 2 (it held
+  version 3); the README has a Licence section.
+- **Windows (CRLF) line endings** for every text file (sources, headers,
+  resource scripts, the INF, the docs, LICENSE); only the `*.sh` / `*.py`
+  build scripts stay LF. `.gitattributes` keeps them that way in every
+  checkout on every platform (the INF is stored byte-for-byte) and
+  `.gitignore` keeps `build/` and other build output out of the repository.
+
+
+## v1.2
 
 Disks plugged in while Windows runs (GitHub issue #1: an 8 TB e-SATA disk
 with one GPT NTFS partition on Windows XP 32-bit was found only when it was
@@ -53,9 +139,9 @@ connected before start-up).
   request the disk driver does not know (the disk-length request on NT
   3.x) is no longer taken as answered when the driver only reports
   success.
-- Version information (1.2.0.0) in the driver and every tool.
+- Version information (1.2) in the driver and every tool.
 
-## v1.1.0.0
+## v1.1
 
 - The installer adds an **MBRGPTNT** program group: Disk / Partition
   Manager, MBRGPTNT Command Line (a command prompt showing `mgptpart`'s
@@ -157,9 +243,9 @@ connected before start-up).
     after the number (`750GB`, `2TB`; MB when there is none).
   - The New partition dialog says how large the free area is when the
     size entered does not fit, instead of a general failure message.
-- Version information (1.1.0.0) in the driver and every tool.
+- Version information (1.1) in the driver and every tool.
 
-## v1.0.0.0
+## v1.0
 
 First release. MBR, GPT and dynamic disk (LDM) driver and tools for
 Windows NT 3.1, 3.5, 3.51, 4.0, 2000 and XP, as i386 and x64 binaries built
