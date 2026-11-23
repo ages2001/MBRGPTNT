@@ -33,6 +33,30 @@ connected before start-up).
   volume. **Removable / hot-plug** volumes are not handed over: they keep the
   driver's own letter management so on-the-fly removal (issue #2) stays
   reliable, and a removable disk is never a paging target anyway.
+- **Boot-start driver on every OS.** The installer now registers MBRGPTNT
+  with `Start = 0` (`SERVICE_BOOT_START`, group *Boot Bus Extender*) on all
+  targets, so the driver loads at boot and its MBR/GPT volumes - including a
+  pure-GPT system or paging volume - exist before the session manager
+  activates the paging file. `ErrorControl` stays *Normal*, so a load
+  failure is logged and boot continues; `DriverEntry` does no disk work
+  (enumeration is deferred to a worker thread), so early load order is safe.
+- **Full PnP on Windows 2000 and later (new 2000/XP 32-bit build).** In
+  addition to the non-PnP Mount-Manager path above, the NT5+ builds are a
+  real PnP **bus driver**. The installer registers a root-enumerated device
+  (`Root\mbrgptnt`, or install `mbrgptnt.inf`), the PnP manager calls the
+  driver's `AddDevice`, and each live volume is reported as a child **PDO**
+  that answers `QUERY_ID` / `QUERY_CAPABILITIES` (`RawDeviceOK`,
+  `SurpriseRemovalOK`) / `QUERY_DEVICE_TEXT` and exposes
+  `GUID_DEVINTERFACE_VOLUME`. That device interface is exactly what the
+  Mount Manager watches, so on these systems the volumes behave as native
+  PnP volumes - Device Manager presence, persistent `\??\Volume{GUID}`
+  names, drive letters and pure-GPT paging - with clean arrival/removal via
+  `IRP_MN_QUERY_DEVICE_RELATIONS`/`REMOVE_DEVICE` instead of polling. The
+  driver is split by OS: `nt31`/`nt35`/`nt40` are the unchanged legacy boot
+  drivers (no PnP imports, so they load on systems with no PnP manager),
+  while `nt50` (2000/XP/2003 x86) and `x64` (XP x64/2003 x64) add the PnP
+  bus. NT 3.x/4.0 keep the driver's own letter management and the legacy
+  Mount-Manager notification.
 - **A powered-off external disk is noticed and re-detected** (GitHub issue
   #2: an external e-SATA disk was connected on the fly only the first time;
   after switching it off and on again it was no longer found). A fixed

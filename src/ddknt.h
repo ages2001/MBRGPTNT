@@ -402,6 +402,105 @@ NTSTATUS NTAPI ZwDeviceIoControlFile(HANDLE, HANDLE Event, PVOID ApcRoutine, PVO
 #define FILE_SYNCHRONOUS_IO_NONALERT 0x00000020
 #define SYNCHRONIZE 0x00100000
 
+/* ------------------------------------------------------------------ *
+ *  PnP / Power - declared unconditionally, but referenced only by the
+ *  NT 5.0+ builds (compiled with -DGPTNT_PNP: nt50, x64). The NT 3.x /
+ *  4.0 builds never touch these symbols, so none of the NT5-only PnP
+ *  exports (IoRegisterDeviceInterface, IoSetDeviceInterfaceState,
+ *  IoInvalidateDeviceRelations, PoCallDriver, ...) end up in their
+ *  import tables and the legacy drivers load exactly as before.
+ * ------------------------------------------------------------------ */
+#define IRP_MJ_PNP             0x1b
+#define IRP_MJ_POWER           0x16
+#define IRP_MJ_SYSTEM_CONTROL  0x17
+
+#define IRP_MN_START_DEVICE                 0x00
+#define IRP_MN_QUERY_REMOVE_DEVICE          0x01
+#define IRP_MN_REMOVE_DEVICE                0x02
+#define IRP_MN_CANCEL_REMOVE_DEVICE         0x03
+#define IRP_MN_STOP_DEVICE                  0x04
+#define IRP_MN_QUERY_STOP_DEVICE            0x05
+#define IRP_MN_CANCEL_STOP_DEVICE           0x06
+#define IRP_MN_QUERY_DEVICE_RELATIONS       0x07
+#define IRP_MN_QUERY_INTERFACE              0x08
+#define IRP_MN_QUERY_CAPABILITIES           0x09
+#define IRP_MN_QUERY_DEVICE_TEXT            0x0c
+#define IRP_MN_QUERY_ID                     0x13
+#define IRP_MN_QUERY_PNP_DEVICE_STATE       0x14
+#define IRP_MN_QUERY_BUS_INFORMATION        0x15
+#define IRP_MN_DEVICE_USAGE_NOTIFICATION    0x16
+#define IRP_MN_SURPRISE_REMOVAL             0x17
+
+typedef enum _DEVICE_RELATION_TYPE {
+    BusRelations = 0, EjectionRelations = 1, PowerRelations = 2,
+    RemovalRelations = 3, TargetDeviceRelation = 4, SingleBusRelations = 5
+} DEVICE_RELATION_TYPE;
+
+typedef enum _BUS_QUERY_ID_TYPE {
+    BusQueryDeviceID = 0, BusQueryHardwareIDs = 1,
+    BusQueryCompatibleIDs = 2, BusQueryInstanceID = 3
+} BUS_QUERY_ID_TYPE;
+
+typedef enum _DEVICE_TEXT_TYPE {
+    DeviceTextDescription = 0, DeviceTextLocationInformation = 1
+} DEVICE_TEXT_TYPE;
+
+typedef enum _DEVICE_POWER_STATE {
+    PowerDeviceUnspecified = 0, PowerDeviceD0, PowerDeviceD1,
+    PowerDeviceD2, PowerDeviceD3, PowerDeviceMaximum
+} DEVICE_POWER_STATE;
+typedef enum _SYSTEM_POWER_STATE { PowerSystemUnspecified = 0 } SYSTEM_POWER_STATE;
+
+typedef struct _DEVICE_RELATIONS { ULONG Count; PDEVICE_OBJECT Objects[1]; }
+    DEVICE_RELATIONS, *PDEVICE_RELATIONS;
+
+/* Exact WDM layout - the PnP manager allocates this and we fill it in. */
+typedef struct _DEVICE_CAPABILITIES {
+    USHORT Size;
+    USHORT Version;
+    ULONG  DeviceD1 : 1, DeviceD2 : 1, LockSupported : 1, EjectSupported : 1,
+           Removable : 1, DockDevice : 1, UniqueID : 1, SilentInstall : 1,
+           RawDeviceOK : 1, SurpriseRemovalOK : 1, WakeFromD0 : 1, WakeFromD1 : 1,
+           WakeFromD2 : 1, WakeFromD3 : 1, HardwareDisabled : 1, NonDynamic : 1,
+           WarmEjectSupported : 1, NoDisplayInUI : 1, Reserved : 14;
+    ULONG  Address;
+    ULONG  UINumber;
+    DEVICE_POWER_STATE DeviceState[7];
+    SYSTEM_POWER_STATE SystemWake;
+    DEVICE_POWER_STATE DeviceWake;
+    ULONG  D1Latency, D2Latency, D3Latency;
+} DEVICE_CAPABILITIES, *PDEVICE_CAPABILITIES;
+
+typedef struct _GUIDX { ULONG Data1; USHORT Data2; USHORT Data3; UCHAR Data4[8]; } GUIDX;
+
+typedef NTSTATUS (NTAPI *PADD_DEVICE_ROUTINE)(PDRIVER_OBJECT, PDEVICE_OBJECT);
+typedef struct _DRIVER_EXTENSION {
+    PDRIVER_OBJECT      DriverObject;
+    PADD_DEVICE_ROUTINE AddDevice;
+    ULONG               Count;
+    UNICODE_STRING      ServiceKeyName;
+} DRIVER_EXTENSION, *PDRIVER_EXTENSION;
+
+#define FILE_DEVICE_BUS_EXTENDER 0x0000002a
+#define DO_POWER_PAGABLE         0x00002000
+
+PDEVICE_OBJECT NTAPI IoAttachDeviceToDeviceStack(PDEVICE_OBJECT, PDEVICE_OBJECT);
+VOID     NTAPI IoDetachDevice(PDEVICE_OBJECT);
+NTSTATUS NTAPI IoRegisterDeviceInterface(PDEVICE_OBJECT, const GUIDX *, PUNICODE_STRING, PUNICODE_STRING);
+NTSTATUS NTAPI IoSetDeviceInterfaceState(PUNICODE_STRING, UCHAR);
+VOID     NTAPI IoInvalidateDeviceRelations(PDEVICE_OBJECT, DEVICE_RELATION_TYPE);
+VOID     NTAPI PoStartNextPowerIrp(PIRP);
+NTSTATUS NTAPI PoCallDriver(PDEVICE_OBJECT, PIRP);
+/* stdcall, so the import-lib generator picks it up like every other API
+   (the fastcall ObfReferenceObject would be missed by its '^_' filter).
+   A NULL ObjectType skips the type check, giving a plain extra reference. */
+NTSTATUS NTAPI ObReferenceObjectByPointer(PVOID, ULONG DesiredAccess, PVOID ObjectType, KPROCESSOR_MODE);
+#define ObReferenceObject(o) ObReferenceObjectByPointer((o), 0, NULL, KernelMode)
+
+#define IoSkipCurrentIrpStackLocation(Irp) do { \
+    (Irp)->CurrentLocation++; \
+    (Irp)->Tail.Overlay.CurrentStackLocation++; } while (0)
+
 /* the layouts the kernels expect */
 #define DDK_OFF(t,f) __builtin_offsetof(t,f)
 #if defined(_WIN64)

@@ -1,0 +1,71 @@
+; mbrgptnt.inf - supported PnP installation for the MBRGPTNT volume bus.
+;
+; MBRGPTNT installs on every target OS as a boot-start kernel service
+; (mbrginst.exe does this on NT 3.1 - XP x64). On Windows 2000 and later
+; the driver is ALSO a PnP bus driver: it exposes each MBR/GPT volume as a
+; PnP device with GUID_DEVINTERFACE_VOLUME, so the Mount Manager owns the
+; drive letters, the persistent \??\Volume{GUID} names and pagefile use on
+; pure-GPT disks natively.
+;
+; mbrginst.exe writes the root-enumerated device node directly, but the
+; Enum\Root key is ACL-protected on XP, so this INF is the supported path:
+;   Device Manager -> Action -> Add legacy hardware -> Install the hardware
+;   that I manually select -> Have Disk -> point at this .inf
+; (or: devcon install mbrgptnt.inf root\mbrgptnt).
+;
+; by ages2001
+
+[Version]
+Signature="$Windows NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+DriverVer=01/01/2026,1.2.0.0
+
+[Manufacturer]
+%Mfg%=Mfg,NT,NTamd64
+
+[Mfg.NT]
+%DevDesc%=Mbrgptnt_Inst,root\mbrgptnt
+
+[Mfg.NTamd64]
+%DevDesc%=Mbrgptnt_Inst,root\mbrgptnt
+
+[Mbrgptnt_Inst.NT]
+CopyFiles=Mbrgptnt_Copy
+
+[Mbrgptnt_Inst.NTamd64]
+CopyFiles=Mbrgptnt_Copy
+
+[Mbrgptnt_Inst.NT.Services]
+AddService=mbrgptnt,0x00000002,Mbrgptnt_Service
+
+[Mbrgptnt_Inst.NTamd64.Services]
+AddService=mbrgptnt,0x00000002,Mbrgptnt_Service
+
+[Mbrgptnt_Service]
+DisplayName=%SvcDesc%
+ServiceType=1           ; SERVICE_KERNEL_DRIVER
+StartType=0             ; SERVICE_BOOT_START (same as the stand-alone installer)
+ErrorControl=1          ; SERVICE_ERROR_NORMAL
+ServiceBinary=%12%\mbrgptnt.sys
+LoadOrderGroup=Boot Bus Extender
+
+[Mbrgptnt_Copy]
+mbrgptnt.sys
+
+[DestinationDirs]
+Mbrgptnt_Copy=12        ; %SystemRoot%\System32\Drivers
+
+[SourceDisksNames]
+1=%Disk%,,,
+
+[SourceDisksFiles]
+mbrgptnt.sys=1
+
+[Strings]
+Provider="ages2001"
+Mfg="ages2001"
+DevDesc="MBRGPTNT GPT Volume Bus"
+SvcDesc="MBRGPTNT MBR+GPT partition driver"
+Disk="MBRGPTNT Installation Disk"

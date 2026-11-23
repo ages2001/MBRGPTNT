@@ -46,15 +46,34 @@ typedef struct _PART_EXT {
     UCHAR             IsGpt;          /* GPT partition (LetterKey is its GUID) */
     UCHAR             SuggestLetter;  /* letter offered to the Mount Manager */
     UCHAR             MgrNotified;    /* arrival notification delivered */
+    UCHAR             PnpReported;    /* handed to the PnP manager (NT5+) */
+    UCHAR             PnpIfOn;        /* volume device interface enabled */
+    UCHAR             PnpDeleted;     /* PnP owns deletion; kept until REMOVE */
+    UNICODE_STRING    PnpIf;          /* the device-interface symbolic-link name */
 } PART_EXT, *PPART_EXT;
 
 typedef struct _CTRL_EXT { ULONG Kind; } CTRL_EXT, *PCTRL_EXT;
+
+/* The PnP bus FDO's extension (NT5+ only). First field Kind, like every
+   extension, so the shared dispatch can tell a bus FDO, a volume PDO and
+   the control device apart by DeviceExtension's first ULONG. */
+typedef struct _BUS_EXT { ULONG Kind; PDEVICE_OBJECT Self, Lower, Pdo; } BUS_EXT, *PBUS_EXT;
+#define KIND_BUS 0x42555320UL   /* 'BUS ' */
 
 typedef struct _ENUMCTX { PDEVICE_OBJECT Part0; ULONG BytesPerSector; gpt_u64 Limit; gpt_u64 BigFrom; } ENUMCTX;
 
 static PDRIVER_OBJECT g_Driver;
 static PDEVICE_OBJECT g_Control;
 static PPART_EXT      g_PartList;
+#ifdef GPTNT_PNP
+static PDEVICE_OBJECT g_PnpBus;    /* our bus FDO (NULL until AddDevice) */
+static PDEVICE_OBJECT g_PnpLower;  /* device under the bus FDO */
+static PDEVICE_OBJECT g_PnpPdo;    /* the root-enumerated physical device */
+static int            g_PnpOn;     /* bus started: report volumes as PDOs */
+static void PnpRescan(void);              /* re-enumerate the bus (BusRelations) */
+static void PnpDisableIf(PPART_EXT p);    /* tear down a volume device interface */
+#endif
+static void RemoveVolumeFinal(PPART_EXT p);
 static KEVENT         g_Lock;
 static KEVENT         g_SyncLock;     /* one SyncDisk at a time */
 static KEVENT         g_ScanLock;     /* one disk check / table write at a time */
@@ -674,6 +693,13 @@ static void PublishLetter(PPART_EXT ext, UCHAR hint)
     want = RegLookupLetterKey(ext->LetterKey);
     if (!want && hint) want = hint;
     removable = (ext->DiskNumber < MGPT_MAXDISK && g_known[ext->DiskNumber].removable);
+#ifdef GPTNT_PNP
+    /* When the PnP bus is running, the volume PDO's device interface tells
+       the Mount Manager about the volume; it owns the letter and the
+       persistent \??\Volume{GUID} name. Just record the hint the Mount
+       Manager asks for via QUERY_SUGGESTED_LINK_NAME and let PnP do it. */
+    if (g_PnpOn) { ext->SuggestLetter = want; if (want) RegSaveLetterKey(ext->LetterKey, want); return; }
+#endif
     if (!removable && MountMgrPresent()) {
         ext->SuggestLetter = want;          /* offered via QUERY_SUGGESTED_LINK_NAME */
         if (want) RegSaveLetterKey(ext->LetterKey, want);
@@ -713,6 +739,9 @@ static int PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNu
         PublishLetter(ext, 0);
     }
     LockList(); ext->Next = g_PartList; g_PartList = ext; UnlockList();
+#ifdef GPTNT_PNP
+    PnpRescan();  /* let the PnP manager pick up the new volume */
+#endif
     D("  "); D(name); D(" type="); DH(P->MbrType); D(" letter="); DH(ext->DriveLetter); D("\n");
     return 1;
 }
@@ -1423,16 +1452,38 @@ static void VolumeName(PPART_EXT p, char *name)
 { int i = 0; while (p->DevName[i]) { name[i] = p->DevName[i]; i++; } name[i] = 0; }
 
 /* Remove one published volume: its drive letter link and device object. */
-static void RemoveVolume(PPART_EXT p)
+/* The real teardown: drop the drive letter, release the lower device and
+   delete the volume device object. */
+static void RemoveVolumeFinal(PPART_EXT p)
 {
     if (p->DriveLetter) {
         char l[32]; UNICODE_STRING ul;
         sprintf(l, "\\DosDevices\\%c:", p->DriveLetter);
         if (NT_SUCCESS(MakeUnicode(l, &ul))) { IoDeleteSymbolicLink(&ul); RtlFreeUnicodeString(&ul); }
     }
+#ifdef GPTNT_PNP
+    PnpDisableIf(p);
+#endif
     if (p->LowerFile) ObDereferenceObject(p->LowerFile);
     if (p->Ldm) LdmFreeRt(p->Ldm);
     IoDeleteDevice(p->Self);
+}
+
+static void RemoveVolume(PPART_EXT p)
+{
+#ifdef GPTNT_PNP
+    /* Once the PnP manager has been handed this volume as a PDO it owns the
+       object's lifetime. Drop the interface and stop reporting it; the next
+       bus re-enumeration makes the PnP manager send IRP_MN_REMOVE_DEVICE,
+       and the REMOVE handler calls RemoveVolumeFinal. */
+    if (g_PnpOn && p->PnpReported && !p->PnpDeleted) {
+        PnpDisableIf(p);
+        p->PnpDeleted = 1;
+        PnpRescan();
+        return;
+    }
+#endif
+    RemoveVolumeFinal(p);
 }
 
 /* Send a file-system control request (FSCTL) for an open volume. NT 3.1
@@ -2060,6 +2111,9 @@ static void LdmPublish(LDMGRP *g, int vi, LDM_VMAP *m)
       PublishLetter(ext, hint);
     }
     LockList(); ext->Next = g_PartList; g_PartList = ext; UnlockList();
+#ifdef GPTNT_PNP
+    PnpRescan();  /* let the PnP manager pick up the new volume */
+#endif
     D("  "); D(name); D(" "); D(v->Name); D(" letter="); DH(ext->DriveLetter); D("\n");
 }
 
@@ -2078,15 +2132,33 @@ static void RetireStale(ULONG DiskNumber)
                 for (t = 0; t < 20 && DeviceInUse(p->Self); t++) { LARGE_INTEGER dl; dl.QuadPart = -500000; KeDelayExecutionThread(KernelMode, FALSE, &dl); }
             }
         }
+#ifdef GPTNT_PNP
+    /* When the PnP bus is live the PnP manager, not this thread, owns the
+       lifetime of every volume it has been handed. Mark such a stale volume
+       Gone (so the next BusRelations drops it) and let IRP_MN_REMOVE_DEVICE
+       unlink and free it - never free it here, or it could race the async
+       REMOVE into a use-after-free. */
+    if (g_PnpOn)
+        for (p = g_PartList; p; p = p->Next)
+            if (p->DiskNumber == DiskNumber && p->Stale && p->PnpReported && !p->Gone)
+                p->Gone = 1;
+#endif
     LockList();
     pp = &g_PartList;
     while (*pp) {
         p = *pp;
-        if (p->DiskNumber == DiskNumber && p->Stale && !DeviceInUse(p->Self)) { *pp = p->Next; p->Next = drop; drop = p; }
+        if (p->DiskNumber == DiskNumber && p->Stale && !DeviceInUse(p->Self)
+#ifdef GPTNT_PNP
+            && !(g_PnpOn && p->PnpReported)   /* PnP frees these via REMOVE */
+#endif
+           ) { *pp = p->Next; p->Next = drop; drop = p; }
         else pp = &p->Next;
     }
     UnlockList();
     while (drop) { p = drop; drop = drop->Next; RemoveVolume(p); }
+#ifdef GPTNT_PNP
+    PnpRescan();   /* drop retired/gone volumes from the PnP device tree */
+#endif
 }
 
 /* Rebuild the disk groups and bring the dynamic volumes in line with them.
@@ -3573,6 +3645,311 @@ static NTSTATUS CreateControlDevice(void)
     return STATUS_SUCCESS;
 }
 
+#ifdef GPTNT_PNP
+/* ================================================================== *
+ *  PnP bus driver (NT 5.0 / 2000 and later only).
+ *
+ *  On NT5+ the installer registers a root-enumerated device whose
+ *  Service is mbrgptnt, so the PnP manager loads this driver as that
+ *  device's function driver and calls MgptAddDevice. The resulting bus
+ *  FDO reports every live MBRGPTNT volume as a child PDO; each PDO
+ *  exposes GUID_DEVINTERFACE_VOLUME, which is exactly what the Mount
+ *  Manager watches - so the volumes get persistent \??\Volume{GUID}
+ *  names, drive letters and pagefile support natively, with no polling.
+ *
+ *  The volume objects are the SAME named \Device\HarddiskN\PartitionM
+ *  devices the enumerator already builds; here they simply double as
+ *  PnP PDOs. On NT 3.x / 4.0 none of this is compiled in and the driver
+ *  stays a pure legacy boot driver.
+ * ================================================================== */
+
+/* GUID_DEVINTERFACE_VOLUME / MOUNTDEV_MOUNTED_DEVICE_GUID */
+static const GUIDX GUID_VOLUME =
+    { 0x53f5630d, 0xb6bf, 0x11d0, { 0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b } };
+
+/* Build a wide (UTF-16LE) copy of an ASCII string in paged pool; the PnP
+   manager frees it. With multisz!=0 a second NUL terminator is appended
+   for a REG_MULTI_SZ style single-entry list (hardware/compatible IDs). */
+static PVOID PnpWide(const char *s, int multisz)
+{
+    ULONG n = 0, i; USHORT *w;
+    while (s[n]) n++;
+    w = (USHORT *)ExAllocatePool(PagedPool, (SIZE_T)(n + 1 + (multisz ? 1 : 0)) * 2);
+    if (!w) return NULL;
+    for (i = 0; i < n; i++) w[i] = (USHORT)(UCHAR)s[i];
+    w[n] = 0; if (multisz) w[n + 1] = 0;
+    return w;
+}
+
+/* Complete a PnP IRP, setting status + information. */
+static NTSTATUS PnpDone(PIRP Irp, NTSTATUS st, ULONG_PTR info)
+{
+    Irp->IoStatus.Status = st; Irp->IoStatus.Information = info;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT); return st;
+}
+/* Complete a PnP IRP a PDO does not handle, leaving status as received. */
+static NTSTATUS PnpPass(PIRP Irp)
+{
+    NTSTATUS st = Irp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT); return st;
+}
+
+static NTSTATUS NTAPI PnpFwdComplete(PDEVICE_OBJECT Dev, PIRP Irp, PVOID Ctx)
+{ (void)Dev; (void)Irp; KeSetEvent((PKEVENT)Ctx, 0, FALSE); return STATUS_MORE_PROCESSING_REQUIRED; }
+
+/* Send an IRP down the bus FDO's stack and wait for it to finish. */
+static NTSTATUS PnpForwardWait(PDEVICE_OBJECT Lower, PIRP Irp)
+{
+    KEVENT ev; NTSTATUS st;
+    PIO_STACK_LOCATION c = IoGetCurrentIrpStackLocation(Irp), n = IoGetNextIrpStackLocation(Irp);
+    KeInitializeEvent(&ev, NotificationEvent, FALSE);
+    n->MajorFunction = c->MajorFunction; n->MinorFunction = c->MinorFunction;
+    n->Flags = c->Flags; n->Control = 0; n->Parameters = c->Parameters;
+    n->FileObject = c->FileObject;
+    n->CompletionRoutine = (PVOID)PnpFwdComplete; n->Context = &ev;
+    n->Control = SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL;
+    st = IoCallDriver(Lower, Irp);
+    if (st == STATUS_PENDING) { KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, NULL); st = Irp->IoStatus.Status; }
+    return st;
+}
+
+/* Enable a volume PDO's device interface (Mount Manager notices it). */
+static void PnpEnableIf(PPART_EXT p)
+{
+    if (p->PnpIfOn) return;
+    if (!NT_SUCCESS(IoRegisterDeviceInterface(p->Self, &GUID_VOLUME, NULL, &p->PnpIf))) return;
+    if (NT_SUCCESS(IoSetDeviceInterfaceState(&p->PnpIf, 1))) p->PnpIfOn = 1;
+}
+static void PnpDisableIf(PPART_EXT p)
+{
+    if (!p->PnpIfOn) return;
+    IoSetDeviceInterfaceState(&p->PnpIf, 0);
+    if (p->PnpIf.Buffer) RtlFreeUnicodeString(&p->PnpIf);
+    p->PnpIfOn = 0;
+}
+
+/* Ask the PnP manager to re-query the bus's children. */
+static void PnpRescan(void)
+{
+    if (g_PnpOn && g_PnpPdo) IoInvalidateDeviceRelations(g_PnpPdo, BusRelations);
+}
+
+/* QUERY_DEVICE_RELATIONS / BusRelations: report every live volume PDO. */
+static NTSTATUS PnpBusRelations(PIRP Irp)
+{
+    PDEVICE_RELATIONS rel; PPART_EXT p; ULONG count = 0, i = 0;
+    LockList();
+    for (p = g_PartList; p; p = p->Next) if (p->Kind == KIND_PART && !p->PnpDeleted && !p->Gone) count++;
+    rel = (PDEVICE_RELATIONS)ExAllocatePool(PagedPool, sizeof(ULONG) + (SIZE_T)(count ? count : 1) * sizeof(PVOID));
+    if (!rel) { UnlockList(); return PnpDone(Irp, STATUS_INSUFFICIENT_RESOURCES, 0); }
+    for (p = g_PartList; p; p = p->Next)
+        if (p->Kind == KIND_PART && !p->PnpDeleted && !p->Gone) {
+            ObReferenceObject(p->Self);     /* PnP manager dereferences later */
+            rel->Objects[i++] = p->Self; p->PnpReported = 1;
+        }
+    rel->Count = i;
+    UnlockList();
+    return PnpDone(Irp, STATUS_SUCCESS, (ULONG_PTR)rel);
+}
+
+/* QUERY_ID for a volume PDO. */
+static NTSTATUS PnpQueryId(PPART_EXT p, PIRP Irp)
+{
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(Irp);
+    BUS_QUERY_ID_TYPE t = (BUS_QUERY_ID_TYPE)(ULONG_PTR)s->Parameters.Others.Argument1;
+    PVOID id = NULL;
+    switch (t) {
+    case BusQueryDeviceID:     id = PnpWide("MBRGPTNT\\Volume", 0); break;
+    case BusQueryHardwareIDs:  id = PnpWide("MBRGPTNT\\Volume", 1); break;
+    case BusQueryCompatibleIDs: id = PnpWide("GenVolume", 1); break;
+    case BusQueryInstanceID: {
+        char ins[40]; int k;
+        if (p->HasKey) { for (k = 0; k < 16; k++) sprintf(ins + k * 2, "%02X", p->LetterKey[k]); ins[32] = 0; }
+        else sprintf(ins, "D%luP%lu", (unsigned long)p->DiskNumber, (unsigned long)p->PartitionNumber);
+        id = PnpWide(ins, 0); break;
+    }
+    default: return PnpPass(Irp);
+    }
+    if (!id) return PnpDone(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+    return PnpDone(Irp, STATUS_SUCCESS, (ULONG_PTR)id);
+}
+
+/* QUERY_CAPABILITIES for a volume PDO. */
+static NTSTATUS PnpCaps(PPART_EXT p, PIRP Irp)
+{
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(Irp);
+    PDEVICE_CAPABILITIES c = (PDEVICE_CAPABILITIES)s->Parameters.Others.Argument1;
+    int removable = (p->DiskNumber < MGPT_MAXDISK && g_known[p->DiskNumber].removable);
+    if (!c || c->Version < 1) return PnpPass(Irp);
+    c->UniqueID = 1;          /* InstanceID is unique system-wide */
+    c->SilentInstall = 1;     /* no install UI for a raw volume */
+    c->RawDeviceOK = 1;       /* works with no function driver on the PDO */
+    c->SurpriseRemovalOK = 1;
+    c->Removable = removable ? 1 : 0;
+    c->Address = p->PartitionNumber;
+    c->UINumber = p->PartitionNumber;
+    return PnpDone(Irp, STATUS_SUCCESS, 0);
+}
+
+/* QUERY_DEVICE_TEXT for a volume PDO. */
+static NTSTATUS PnpText(PPART_EXT p, PIRP Irp)
+{
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(Irp);
+    DEVICE_TEXT_TYPE t = (DEVICE_TEXT_TYPE)(ULONG_PTR)s->Parameters.Others.Argument1;
+    PVOID txt; (void)p;
+    if (t != DeviceTextDescription) return PnpPass(Irp);
+    txt = PnpWide("MBRGPTNT Volume", 0);
+    if (!txt) return PnpPass(Irp);
+    return PnpDone(Irp, STATUS_SUCCESS, (ULONG_PTR)txt);
+}
+
+/* TargetDeviceRelation for a volume PDO: itself, referenced. */
+static NTSTATUS PnpTargetRelation(PPART_EXT p, PIRP Irp)
+{
+    PDEVICE_RELATIONS rel = (PDEVICE_RELATIONS)ExAllocatePool(PagedPool, sizeof(ULONG) + sizeof(PVOID));
+    if (!rel) return PnpDone(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+    ObReferenceObject(p->Self);
+    rel->Count = 1; rel->Objects[0] = p->Self;
+    return PnpDone(Irp, STATUS_SUCCESS, (ULONG_PTR)rel);
+}
+
+/* PnP dispatch for a volume PDO. */
+static NTSTATUS PnpPdo(PPART_EXT p, PIRP Irp)
+{
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(Irp);
+    switch (s->MinorFunction) {
+    case IRP_MN_START_DEVICE:
+        PnpEnableIf(p);
+        return PnpDone(Irp, STATUS_SUCCESS, 0);
+    case IRP_MN_QUERY_ID:            return PnpQueryId(p, Irp);
+    case IRP_MN_QUERY_CAPABILITIES:  return PnpCaps(p, Irp);
+    case IRP_MN_QUERY_DEVICE_TEXT:   return PnpText(p, Irp);
+    case IRP_MN_QUERY_DEVICE_RELATIONS:
+        if ((DEVICE_RELATION_TYPE)(ULONG_PTR)s->Parameters.Others.Argument1 == TargetDeviceRelation)
+            return PnpTargetRelation(p, Irp);
+        return PnpPass(Irp);
+    case IRP_MN_QUERY_PNP_DEVICE_STATE: return PnpDone(Irp, STATUS_SUCCESS, 0);
+    case IRP_MN_QUERY_REMOVE_DEVICE:
+    case IRP_MN_CANCEL_REMOVE_DEVICE:
+    case IRP_MN_QUERY_STOP_DEVICE:
+    case IRP_MN_CANCEL_STOP_DEVICE:
+    case IRP_MN_STOP_DEVICE:
+        return PnpDone(Irp, STATUS_SUCCESS, 0);
+    case IRP_MN_SURPRISE_REMOVAL:
+        PnpDisableIf(p);
+        return PnpDone(Irp, STATUS_SUCCESS, 0);
+    case IRP_MN_REMOVE_DEVICE: {
+        PPART_EXT q, *pp;
+        PnpDisableIf(p);
+        LockList();                 /* unlink if still on the list */
+        for (pp = &g_PartList; (q = *pp) != NULL; pp = &q->Next)
+            if (q == p) { *pp = q->Next; break; }
+        UnlockList();
+        PnpDone(Irp, STATUS_SUCCESS, 0);
+        RemoveVolumeFinal(p);       /* frees the extension - do last */
+        return STATUS_SUCCESS;
+    }
+    default:
+        return PnpPass(Irp);
+    }
+}
+
+/* PnP dispatch for the bus FDO. */
+static NTSTATUS PnpBus(PBUS_EXT b, PIRP Irp)
+{
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS st;
+    switch (s->MinorFunction) {
+    case IRP_MN_START_DEVICE:
+        st = PnpForwardWait(b->Lower, Irp);
+        if (NT_SUCCESS(st)) g_PnpOn = 1;
+        PnpDone(Irp, st, 0);
+        if (NT_SUCCESS(st)) PnpRescan();
+        return st;
+    case IRP_MN_QUERY_DEVICE_RELATIONS:
+        if ((DEVICE_RELATION_TYPE)(ULONG_PTR)s->Parameters.Others.Argument1 == BusRelations)
+            return PnpBusRelations(Irp);
+        break;                      /* other relation types: pass down */
+    case IRP_MN_QUERY_REMOVE_DEVICE:
+    case IRP_MN_CANCEL_REMOVE_DEVICE:
+    case IRP_MN_QUERY_STOP_DEVICE:
+    case IRP_MN_CANCEL_STOP_DEVICE:
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;                      /* allow, pass down */
+    case IRP_MN_SURPRISE_REMOVAL:
+    case IRP_MN_STOP_DEVICE:
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        break;
+    case IRP_MN_REMOVE_DEVICE:
+        g_PnpOn = 0;
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        IoSkipCurrentIrpStackLocation(Irp);
+        st = IoCallDriver(b->Lower, Irp);
+        IoDetachDevice(b->Lower);
+        IoDeleteDevice(b->Self);
+        g_PnpBus = NULL; g_PnpLower = NULL; g_PnpPdo = NULL;
+        return st;
+    default:
+        break;
+    }
+    IoSkipCurrentIrpStackLocation(Irp);
+    return IoCallDriver(b->Lower, Irp);
+}
+
+/* IRP_MJ_PNP entry: route by device kind. */
+static NTSTATUS NTAPI DispPnp(PDEVICE_OBJECT Dev, PIRP Irp)
+{
+    ULONG kind = *(ULONG *)Dev->DeviceExtension;
+    if (kind == KIND_BUS)  return PnpBus((PBUS_EXT)Dev->DeviceExtension, Irp);
+    if (kind == KIND_PART) return PnpPdo((PPART_EXT)Dev->DeviceExtension, Irp);
+    return PnpPass(Irp);            /* control device: not a PnP device */
+}
+
+/* IRP_MJ_POWER entry. */
+static NTSTATUS NTAPI DispPower(PDEVICE_OBJECT Dev, PIRP Irp)
+{
+    ULONG kind = *(ULONG *)Dev->DeviceExtension;
+    PoStartNextPowerIrp(Irp);
+    if (kind == KIND_BUS) {
+        PBUS_EXT b = (PBUS_EXT)Dev->DeviceExtension;
+        IoSkipCurrentIrpStackLocation(Irp);
+        return PoCallDriver(b->Lower, Irp);
+    }
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+/* IRP_MJ_SYSTEM_CONTROL (WMI) entry: FDO passes down, PDO declines. */
+static NTSTATUS NTAPI DispSysCtl(PDEVICE_OBJECT Dev, PIRP Irp)
+{
+    ULONG kind = *(ULONG *)Dev->DeviceExtension;
+    if (kind == KIND_BUS) {
+        PBUS_EXT b = (PBUS_EXT)Dev->DeviceExtension;
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(b->Lower, Irp);
+    }
+    return PnpPass(Irp);
+}
+
+/* The PnP manager found our root-enumerated device: build the bus FDO. */
+static NTSTATUS NTAPI MgptAddDevice(PDRIVER_OBJECT Driver, PDEVICE_OBJECT Pdo)
+{
+    PDEVICE_OBJECT fdo; PBUS_EXT b; NTSTATUS st;
+    st = IoCreateDevice(Driver, sizeof(BUS_EXT), NULL, FILE_DEVICE_BUS_EXTENDER, 0, FALSE, &fdo);
+    if (!NT_SUCCESS(st)) return st;
+    b = (PBUS_EXT)fdo->DeviceExtension;
+    b->Kind = KIND_BUS; b->Self = fdo; b->Pdo = Pdo;
+    b->Lower = IoAttachDeviceToDeviceStack(fdo, Pdo);
+    if (!b->Lower) { IoDeleteDevice(fdo); return STATUS_NO_SUCH_DEVICE; }
+    fdo->Flags |= DO_POWER_PAGABLE;
+    g_PnpBus = fdo; g_PnpLower = b->Lower; g_PnpPdo = Pdo;
+    fdo->Flags &= ~DO_DEVICE_INITIALIZING;
+    D("MBRGPTNT PnP bus attached\n");
+    return STATUS_SUCCESS;
+}
+#endif /* GPTNT_PNP */
+
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
 {
     HANDLE hThread; NTSTATUS st;
@@ -3593,6 +3970,15 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
     Driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = (PVOID)DispDeviceControl;
     Driver->MajorFunction[IRP_MJ_FLUSH_BUFFERS]  = (PVOID)DispPassThrough;
     Driver->MajorFunction[IRP_MJ_SHUTDOWN]       = (PVOID)DispPassThrough;
+#ifdef GPTNT_PNP
+    /* NT 5.0+ only: become a PnP bus driver for the root-enumerated device
+       the installer registers. The AddDevice field is harmless on systems
+       with no PnP manager (it is simply never called). */
+    Driver->MajorFunction[IRP_MJ_PNP]            = (PVOID)DispPnp;
+    Driver->MajorFunction[IRP_MJ_POWER]          = (PVOID)DispPower;
+    Driver->MajorFunction[IRP_MJ_SYSTEM_CONTROL] = (PVOID)DispSysCtl;
+    ((PDRIVER_EXTENSION)Driver->DriverExtension)->AddDevice = MgptAddDevice;
+#endif
     CreateControlDevice();
     KeInitializeEvent(&g_bigLock, SynchronizationEvent, TRUE);
     KeInitializeEvent(&g_bigWake, SynchronizationEvent, FALSE);

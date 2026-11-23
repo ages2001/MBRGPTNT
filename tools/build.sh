@@ -7,7 +7,9 @@ DEFS=""
 [ "${GPTNT_DBG:-0}" = "1" ] && DEFS="$DEFS -DGPTNT_DBG"
 CFLAGS="--target=i686-pc-windows-msvc -march=i486 -ffreestanding -fno-stack-protector -fno-builtin -fno-zero-initialized-in-bss -O1 -Wall $DEFS"
 
-CFLAGS64="--target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -fno-builtin -fno-zero-initialized-in-bss -mno-red-zone -mgeneral-regs-only -O1 -Wall $DEFS"
+# x64 (Windows XP x64 / Server 2003 x64) always has the PnP manager, so the
+# PnP bus path is compiled in unconditionally there.
+CFLAGS64="--target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -fno-builtin -fno-zero-initialized-in-bss -mno-red-zone -mgeneral-regs-only -O1 -Wall -DGPTNT_PNP $DEFS"
 
 # x64: Windows XP x64 / Server 2003 x64 and later
 build_x64() {
@@ -33,20 +35,23 @@ PY
 }
 
 build_one() {
-    local target="$1" subver
+    local target="$1" subver xdef=""
     case "$target" in
         nt31) subver="native,3.10" ;;
         nt35) subver="native,3.50" ;;
         nt40) subver="native,4.00" ;;
+        # NT 5.0 (Windows 2000) and XP 32-bit: has the PnP manager, so the
+        # 32-bit PnP bus build goes here. One binary covers 2000/XP/2003 x86.
+        nt50) subver="native,5.00"; xdef="-DGPTNT_PNP" ;;
         x64) build_x64; return ;;
         *) echo "unknown target $target"; return 1 ;;
     esac
     local out="$ROOT/build/$target"
     mkdir -p "$out"
     echo "[*] $target: compiling"
-    clang $CFLAGS -c "$SRC/gptcore.c" -o "$out/gptcore.obj"
-    clang $CFLAGS -c "$SRC/ldmcore.c" -o "$out/ldmcore.obj"
-    clang $CFLAGS -c "$SRC/mgptdrv.c" -o "$out/mgptdrv.obj"
+    clang $CFLAGS $xdef -c "$SRC/gptcore.c" -o "$out/gptcore.obj"
+    clang $CFLAGS $xdef -c "$SRC/ldmcore.c" -o "$out/ldmcore.obj"
+    clang $CFLAGS $xdef -c "$SRC/mgptdrv.c" -o "$out/mgptdrv.obj"
     local prov und def="$out/ntoskrnl.def" s
     prov=$(llvm-nm --defined-only "$out/gptcore.obj" "$out/ldmcore.obj" "$out/mgptdrv.obj" 2>/dev/null | awk '{print $NF}' | sort -u)
     und=$(llvm-nm --undefined-only "$out/gptcore.obj" "$out/ldmcore.obj" "$out/mgptdrv.obj" 2>/dev/null | awk '{print $NF}' | grep -E '^_' | sort -u)
@@ -65,6 +70,6 @@ PY
 }
 
 T="${1:-all}"
-if [ "$T" = "all" ]; then for t in nt31 nt35 nt40 x64; do build_one "$t"; done
+if [ "$T" = "all" ]; then for t in nt31 nt35 nt40 nt50 x64; do build_one "$t"; done
 else build_one "$T"; fi
 echo "[*] done"

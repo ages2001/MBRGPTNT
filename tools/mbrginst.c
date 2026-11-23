@@ -39,6 +39,7 @@ __declspec(dllimport) BOOL  __stdcall MoveFileExA(LPCSTR,LPCSTR,DWORD);
 __declspec(dllimport) DWORD __stdcall GetVersion(void);
 __declspec(dllimport) unsigned int __stdcall WinExec(LPCSTR,unsigned int);
 #define REG_SZ 1
+#define REG_MULTI_SZ 7
 #define SW_HIDE 0
 #define MOVEFILE_REPLACE_EXISTING   1
 #define MOVEFILE_DELAY_UNTIL_REBOOT 4
@@ -74,12 +75,26 @@ void __stdcall MbrgInstEntry(void){
     n=GetModuleFileNameA(NULL,exe,MAX_PATH);
     scopy(dir,exe);cut=0;for(i=0;i<n;i++)if(dir[i]=='\\')cut=i;dir[cut+1]=0;
     GetWindowsDirectoryA(win,MAX_PATH);
-    /* driver -> System32\Drivers */
-    scopy(src,dir);scat(src,"mbrgptnt.sys");
-    scopy(dst,win);scat(dst,"\\System32\\Drivers\\mbrgptnt.sys");
-    switch(Install(src,dst)){
-    case 0: outs("could not copy driver (");outs(src);outs("). Run from the install folder.\r\n");ExitProcess(1);
-    case 2: outs("  the driver in use is replaced at the next restart\r\n");break;
+    /* driver -> System32\Drivers. On NT 5.0+ (2000/XP) prefer the PnP build
+       from the nt50\ sub-folder if the package ships it; it imports NT5-only
+       PnP APIs, so it must NOT be used on NT 3.x/4.0. The default
+       mbrgptnt.sys beside the installer is the universal legacy build. */
+    {
+        int done=0;
+        scopy(dst,win);scat(dst,"\\System32\\Drivers\\mbrgptnt.sys");
+        if((GetVersion()&0xFF)>=5){
+            int r; scopy(src,dir);scat(src,"nt50\\mbrgptnt.sys");
+            r=Install(src,dst);
+            if(r){ done=1; outs("  installed the PnP driver build (2000/XP)\r\n");
+                   if(r==2) outs("  the driver in use is replaced at the next restart\r\n"); }
+        }
+        if(!done){
+            scopy(src,dir);scat(src,"mbrgptnt.sys");
+            switch(Install(src,dst)){
+            case 0: outs("could not copy driver (");outs(src);outs("). Run from the install folder.\r\n");ExitProcess(1);
+            case 2: outs("  the driver in use is replaced at the next restart\r\n");break;
+            }
+        }
     }
     /* tools (GUI, console, this installer) -> System32 so they are on PATH */
     for(i=0;i<5;i++){
@@ -92,10 +107,36 @@ void __stdcall MbrgInstEntry(void){
     }
     rc=RegCreateKeyExA(HKEY_LOCAL_MACHINE,SvcKey,0,NULL,0,KEY_ALL_ACCESS,NULL,&hk,&disp);
     if(rc!=ERROR_SUCCESS){outs("driver copied, service registration failed (Administrator?).\r\n");ExitProcess(1);}
-    dw=1;RegSetValueExA(hk,"Type",0,REG_DWORD,(const BYTE*)&dw,4);
-    dw=1;RegSetValueExA(hk,"Start",0,REG_DWORD,(const BYTE*)&dw,4);
-    dw=1;RegSetValueExA(hk,"ErrorControl",0,REG_DWORD,(const BYTE*)&dw,4);
+    dw=1;RegSetValueExA(hk,"Type",0,REG_DWORD,(const BYTE*)&dw,4);         /* SERVICE_KERNEL_DRIVER */
+    dw=0;RegSetValueExA(hk,"Start",0,REG_DWORD,(const BYTE*)&dw,4);        /* SERVICE_BOOT_START: load at boot on every OS so GPT system/pagefile volumes exist before the session manager needs them */
+    dw=1;RegSetValueExA(hk,"ErrorControl",0,REG_DWORD,(const BYTE*)&dw,4); /* NORMAL: a load failure is logged, boot continues */
+    RegSetValueExA(hk,"Group",0,REG_SZ,(const BYTE*)"Boot Bus Extender",18);
     RegCloseKey(hk);
+    outs("  registered as a boot-start driver (Start=0)\r\n");
+    /* NT 5.0 (2000) and later: register a root-enumerated PnP device whose
+       Service is this driver, so the PnP manager loads MBRGPTNT as its
+       function driver and calls AddDevice -> the volumes become real PnP
+       PDOs with GUID_DEVINTERFACE_VOLUME. NT 3.x / 4.0 have no PnP manager
+       and ignore this. The Enum\Root key can be ACL-protected (notably on
+       XP), so this is best-effort; mbrgptnt.inf is the supported fallback. */
+    if((GetVersion()&0xFF)>=5){
+        static const char Enum0[]="SYSTEM\\CurrentControlSet\\Enum\\Root\\MBRGPTNT\\0000";
+        static const char EnumP[]="SYSTEM\\CurrentControlSet\\Enum\\Root\\MBRGPTNT";
+        if(RegCreateKeyExA(HKEY_LOCAL_MACHINE,Enum0,0,NULL,0,KEY_ALL_ACCESS,NULL,&hk,&disp)==ERROR_SUCCESS){
+            RegSetValueExA(hk,"Service",0,REG_SZ,(const BYTE*)"mbrgptnt",9);
+            RegSetValueExA(hk,"ClassGUID",0,REG_SZ,(const BYTE*)"{4D36E97D-E325-11CE-BFC1-08002BE10318}",39);
+            RegSetValueExA(hk,"Class",0,REG_SZ,(const BYTE*)"System",7);
+            RegSetValueExA(hk,"DeviceDesc",0,REG_SZ,(const BYTE*)"MBRGPTNT GPT Volume Bus",24);
+            RegSetValueExA(hk,"HardwareID",0,REG_MULTI_SZ,(const BYTE*)"root\\mbrgptnt\0",14);
+            dw=0;RegSetValueExA(hk,"ConfigFlags",0,REG_DWORD,(const BYTE*)&dw,4);
+            RegCloseKey(hk);
+            if(RegCreateKeyExA(HKEY_LOCAL_MACHINE,EnumP,0,NULL,0,KEY_ALL_ACCESS,NULL,&hk,&disp)==ERROR_SUCCESS){
+                dw=1;RegSetValueExA(hk,"NextInstance",0,REG_DWORD,(const BYTE*)&dw,4);RegCloseKey(hk);
+            }
+            outs("  registered the PnP volume bus (2000/XP/2003)\r\n");
+        } else
+            outs("  PnP bus node not written (protected Enum key); use mbrgptnt.inf\r\n");
+    }
     /* NT 4.0 and later: the drive-letter notifier runs in every logon
        session, so Explorer shows the letters of disks plugged in while
        Windows runs (NT 3.x has no Explorer and no Run key) */

@@ -398,7 +398,10 @@ i386/               Windows NT 3.1, 3.5, 3.51, 4.0, 2000, XP (32-bit)
   mgptpart.exe        command-line tool
   mgptgui.exe         graphical Disk / Partition Manager
   mgptntfy.exe        drive-letter notifier for Explorer (NT 4.0 and later)
-  nt31/ nt35/ nt40/   the same driver with subsystem 3.10 / 3.50 / 4.00 (optional)
+  nt31/ nt35/ nt40/   the same legacy driver with subsystem 3.10 / 3.50 / 4.00 (optional)
+  nt50/mbrgptnt.sys   the PnP driver build for Windows 2000 / XP / 2003 (i386);
+                      the installer copies it in place of mbrgptnt.sys on NT 5.0+
+  mbrgptnt.inf        supported PnP install (Add legacy hardware / devcon)
 x64/                Windows XP x64 / Server 2003 x64
   mbrgptnt.sys        the x64 driver
   mbrginst.exe  mbrgunin.exe  mgptpart.exe  mgptgui.exe  mgptntfy.exe   x64 builds of the tools
@@ -416,8 +419,9 @@ folder (x64 Windows), run `mbrginst` as an Administrator. It copies
 (`mgptgui.exe`, `mgptpart.exe`, `mbrginst.exe`, `mbrgunin.exe`,
 `mgptntfy.exe`) into `%SystemRoot%\System32` so they are on the PATH,
 creates the service
-`HKLM\SYSTEM\CurrentControlSet\Services\mbrgptnt` (kernel driver, system
-start), and adds the **MBRGPTNT** program group — a common group in
+`HKLM\SYSTEM\CurrentControlSet\Services\mbrgptnt` (kernel driver,
+**boot start** so GPT system/paging volumes exist before the session
+manager needs them), and adds the **MBRGPTNT** program group — a common group in
 Program Manager on NT 3.x, a Start menu folder on NT 4.0 and later — with
 these items:
 
@@ -448,11 +452,25 @@ Use the x64 installer on x64 Windows: a 32-bit program there is redirected
 away from the real `System32`. XP x64 / 2003 x64 load the unsigned driver
 (they do not enforce driver signing).
 
-The same i386 `mbrgptnt.sys` works on NT 3.1, 3.5, 3.51, 4.0, 2000 and XP —
-its imports are all exported by every one of those kernels and the
-structures it uses are identical across them. The per-subsystem builds under
-`i386/nt31`, `nt35` and `nt40` are provided only if you prefer an exact
-subsystem-version match.
+The default i386 `mbrgptnt.sys` is the **legacy** build: it works on NT 3.1,
+3.5, 3.51, 4.0, 2000 and XP — its imports are all exported by every one of
+those kernels and the structures it uses are identical across them. The
+per-subsystem legacy builds under `i386/nt31`, `nt35` and `nt40` are provided
+only if you prefer an exact subsystem-version match.
+
+**Boot start and PnP.** On every OS the driver is registered as a *boot-start*
+service (`Start = 0`), so its MBR/GPT volumes — including a pure-GPT system or
+paging volume — are available before paging is activated. On **Windows 2000
+and later** the installer additionally copies the PnP build from `i386/nt50`
+(the x64 build is always PnP) and registers a root-enumerated device
+(`Root\mbrgptnt`), so the driver's `AddDevice` runs and every volume becomes a
+real PnP device exposing `GUID_DEVINTERFACE_VOLUME`: the Mount Manager then
+owns the drive letters and persistent `\??\Volume{GUID}` names and the paging
+file works on pure GPT, natively. The PnP build imports NT5-only APIs and is
+**not** loaded on NT 3.x/4.0, which keep the legacy build and the driver's own
+letter management. If the `Enum\Root` key is ACL-protected (notably on XP) the
+installer says so; install `mbrgptnt.inf` instead (Device Manager → Add legacy
+hardware → Have Disk, or `devcon install mbrgptnt.inf root\mbrgptnt`).
 
 ## Using the tools
 
