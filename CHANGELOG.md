@@ -6,6 +6,42 @@ Disks plugged in while Windows runs (GitHub issue #1: an 8 TB e-SATA disk
 with one GPT NTFS partition on Windows XP 32-bit was found only when it was
 connected before start-up).
 
+- **Drive letters are now kept across restarts** (GitHub issue #3: on
+  Windows 2000 a letter the user picked was lost on the next boot). Because
+  the volumes this driver publishes are not PnP volumes, the Mount Manager
+  does not persist their letters, so each boot handed out the first free
+  letter again. MBRGPTNT now remembers the letter itself, keyed by a stable
+  volume id - the GPT partition GUID, or the MBR disk signature plus the
+  partition start LBA - under its own service key
+  `HKLM\System\CurrentControlSet\Services\<driver>\Letters` (one value per
+  volume). On start-up the stored letter is reused when it is free, a newly
+  assigned letter is written back, and a letter the user changes at run time
+  is captured on the next disk-check pass and persisted too. Applies to
+  basic MBR/GPT volumes and to dynamic (LDM) volumes.
+- **Pure-GPT paging file now works, and the Mount Manager owns the letters of
+  fixed volumes.** On NT5+ (2000/XP) a legacy driver's volumes were invisible
+  to the Mount Manager, so the Memory Manager refused them a paging file -
+  pure GPT then showed XP's "Limited Virtual Memory" warning. Each **fixed**
+  volume is now made Mount-Manager-aware the non-PnP way: it answers the
+  MOUNTDEV query set (`IOCTL_MOUNTDEV_QUERY_UNIQUE_ID` / `_DEVICE_NAME` /
+  `_STABLE_GUID` / `_SUGGESTED_LINK_NAME`) and posts a volume-arrival
+  notification to `\Device\MountPointManager`. The Mount Manager then
+  enumerates the volume, assigns and persists its drive letter natively (so
+  issue #3 is handled by the OS on these systems, with the driver's own
+  `\Letters` store as the suggested letter and the fallback where there is no
+  Mount Manager - NT 3.x/4.0), and the paging file can be created on a pure-GPT
+  volume. **Removable / hot-plug** volumes are not handed over: they keep the
+  driver's own letter management so on-the-fly removal (issue #2) stays
+  reliable, and a removable disk is never a paging target anyway.
+- **A powered-off external disk is noticed and re-detected** (GitHub issue
+  #2: an external e-SATA disk was connected on the fly only the first time;
+  after switching it off and on again it was no longer found). A fixed
+  external disk keeps its device object when switched off and answers its
+  geometry from cache, so a geometry-only check never saw it go away and so
+  never re-detected it. The disk-check pass now reads sector 0 of every disk
+  (not only removable media), so a disk that is off is seen as gone and is
+  published again when it returns; the signature read there also catches a
+  disk swapped for another.
 - **A disk that is not ready when it shows up is read again.** A disk
   plugged in while Windows runs can still be spinning up when the disk
   driver creates its device, and a disk past 2 TiB may not answer READ

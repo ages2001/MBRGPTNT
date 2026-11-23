@@ -41,6 +41,11 @@ typedef struct _PART_EXT {
                                          disk driver's reach ends; requests
                                          past it go through BigIo */
     char              DevName[40];    /* \Device\... name */
+    UCHAR             LetterKey[16];  /* stable volume id for persistent letters (issue #3) */
+    UCHAR             HasKey;         /* LetterKey is set */
+    UCHAR             IsGpt;          /* GPT partition (LetterKey is its GUID) */
+    UCHAR             SuggestLetter;  /* letter offered to the Mount Manager */
+    UCHAR             MgrNotified;    /* arrival notification delivered */
 } PART_EXT, *PPART_EXT;
 
 typedef struct _CTRL_EXT { ULONG Kind; } CTRL_EXT, *PCTRL_EXT;
@@ -365,6 +370,7 @@ static NTSTATUS VolumeIoctlEx(PPART_EXT ext, PIRP Irp, ULONG code, PVOID sys, UL
     return STATUS_SUCCESS;
 }
 
+static int MountDevIoctl(PPART_EXT ext, PIRP Irp, ULONG code, PVOID sys, ULONG outlen, NTSTATUS *out); /* fwd */
 static NTSTATUS NTAPI DispDeviceControl(PDEVICE_OBJECT Dev, PIRP Irp)
 {
     PIO_STACK_LOCATION cur = IoGetCurrentIrpStackLocation(Irp);
@@ -376,6 +382,7 @@ static NTSTATUS NTAPI DispDeviceControl(PDEVICE_OBJECT Dev, PIRP Irp)
     PIO_STACK_LOCATION nxt;
     if (ext->Kind == KIND_CTRL) return ControlIoctl(Irp, code, sys, inlen, outlen);
     if (ext->Gone) return Complete(Irp, STATUS_NO_SUCH_DEVICE, 0);
+    { NTSTATUS st; if (MountDevIoctl(ext, Irp, code, sys, outlen, &st)) return st; }
     if (ext->Ldm) return LdmDeviceControl(ext, Irp, code, sys, inlen, outlen);
     { int h; NTSTATUS st = VolumeIoctlEx(ext, Irp, code, sys, inlen, outlen,
                                          (gpt_u64)ext->StartingOffset.QuadPart, &h);
@@ -428,6 +435,95 @@ static NTSTATUS NTAPI DispPassThrough(PDEVICE_OBJECT Dev, PIRP Irp)
     return IoCallDriver(ext->LowerDevice, Irp);
 }
 
+/* ---- persistent drive letters (GitHub issue #3) ---------------------
+   Other NT systems (Win2000 first reported it) let the user pick a drive
+   letter for a volume this driver publishes, but because the volume is not
+   a PnP volume the Mount Manager does not persist the choice: on the next
+   boot the first free letter is handed out again and the user's letter is
+   lost. We persist it ourselves, keyed by a stable volume id - the GPT
+   partition GUID, or the MBR disk signature plus the partition start LBA -
+   under the driver's own service key <RegistryPath>\Letters (one REG_BINARY
+   value per volume, data = the one letter). On publish the stored letter is
+   reused when it is free; a newly assigned letter is written back; and a
+   letter the user later changes is captured on the next disk-check pass. */
+static UNICODE_STRING g_RegPath;
+static WCHAR          g_RegPathBuf[260];
+static UCHAR LinkLetter(UCHAR c, const char *devName);   /* fwd */
+
+static void SaveRegPath(PUNICODE_STRING RegPath)
+{
+    USHORT n = (RegPath && RegPath->Buffer) ? RegPath->Length : 0;
+    if (n && n <= (USHORT)(sizeof(g_RegPathBuf) - sizeof(WCHAR))) {
+        memcpy(g_RegPathBuf, RegPath->Buffer, n);
+        g_RegPath.Buffer = g_RegPathBuf; g_RegPath.Length = n;
+        g_RegPath.MaximumLength = sizeof(g_RegPathBuf);
+    } else { g_RegPath.Buffer = NULL; g_RegPath.Length = 0; g_RegPath.MaximumLength = 0; }
+}
+
+static HANDLE OpenLettersKey(int create)
+{
+    UNICODE_STRING us; OBJECT_ATTRIBUTES oa; HANDLE h = NULL; NTSTATUS st;
+    static WCHAR buf[300]; USHORT i, n; const char *s = "\\Letters"; int k;
+    if (!g_RegPath.Buffer) return NULL;
+    n = (USHORT)(g_RegPath.Length / sizeof(WCHAR));
+    if ((ULONG)n + 9 >= 300) return NULL;
+    for (i = 0; i < n; i++) buf[i] = g_RegPath.Buffer[i];
+    for (k = 0; s[k]; k++) buf[n + k] = (WCHAR)s[k];
+    n = (USHORT)(n + k); buf[n] = 0;
+    us.Buffer = buf; us.Length = (USHORT)(n * sizeof(WCHAR)); us.MaximumLength = (USHORT)((n + 1) * sizeof(WCHAR));
+    InitObjAttr(&oa, &us); oa.Attributes |= OBJ_KERNEL_HANDLE;
+    if (create) { ULONG disp; st = ZwCreateKey(&h, KEY_ALL_ACCESS, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, &disp); }
+    else          st = ZwOpenKey(&h, KEY_READ | KEY_WRITE, &oa);
+    return NT_SUCCESS(st) ? h : NULL;
+}
+
+static void KeyToWName(const UCHAR kk[16], WCHAR *out)
+{
+    const char *h = "0123456789ABCDEF"; int i;
+    for (i = 0; i < 16; i++) { out[i*2] = (WCHAR)h[(kk[i] >> 4) & 0xF]; out[i*2+1] = (WCHAR)h[kk[i] & 0xF]; }
+    out[32] = 0;
+}
+
+static void VolumeKey(const GPT_PARTITION *P, const GPT_DISK *disk, UCHAR out[16])
+{
+    int i; for (i = 0; i < 16; i++) out[i] = 0;
+    if (P->IsGptEntry) { for (i = 0; i < 16; i++) out[i] = P->UniqueGuid[i]; }
+    else {
+        ULONG sig = disk ? disk->DiskSignatureLba0 : 0; gpt_u64 lba = P->StartLba;
+        out[0]=(UCHAR)sig; out[1]=(UCHAR)(sig>>8); out[2]=(UCHAR)(sig>>16); out[3]=(UCHAR)(sig>>24);
+        for (i = 0; i < 8; i++) out[4+i] = (UCHAR)(lba >> (i*8));
+    }
+}
+
+static UCHAR RegLookupLetterKey(const UCHAR kk[16])
+{
+    HANDLE h; UNICODE_STRING vn; WCHAR wname[36]; UCHAR letter = 0;
+    UCHAR info[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 8]; ULONG rl = 0; NTSTATUS st;
+    h = OpenLettersKey(0);
+    if (!h) return 0;
+    KeyToWName(kk, wname);
+    vn.Buffer = wname; vn.Length = 32 * sizeof(WCHAR); vn.MaximumLength = 33 * sizeof(WCHAR);
+    st = ZwQueryValueKey(h, &vn, KeyValuePartialInformationClass, info, sizeof(info), &rl);
+    if (NT_SUCCESS(st)) {
+        KEY_VALUE_PARTIAL_INFORMATION *p = (KEY_VALUE_PARTIAL_INFORMATION *)info;
+        if (p->DataLength >= 1) letter = p->Data[0];
+    }
+    ZwClose(h);
+    return (letter >= 'C' && letter <= 'Z') ? letter : 0;
+}
+
+static void RegSaveLetterKey(const UCHAR kk[16], UCHAR letter)
+{
+    HANDLE h; UNICODE_STRING vn; WCHAR wname[36]; UCHAR data;
+    if (letter < 'C' || letter > 'Z') return;
+    h = OpenLettersKey(1);
+    if (!h) return;
+    KeyToWName(kk, wname); data = letter;
+    vn.Buffer = wname; vn.Length = 32 * sizeof(WCHAR); vn.MaximumLength = 33 * sizeof(WCHAR);
+    ZwSetValueKey(h, &vn, 0, REG_BINARY, &data, 1);
+    ZwClose(h);
+}
+
 /* Assign the first free drive letter in ascending order, starting at C:.
    IoCreateSymbolicLink fails with a name collision for a letter already in
    use (the system's own C:, D:, ... volumes), so the first that succeeds is
@@ -446,7 +542,150 @@ static UCHAR AssignDriveLetter(const char *DeviceName)
     return 0;
 }
 
-static int PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNumber, GPT_PARTITION *P, ULONG Bps, gpt_u64 BigFromLba)
+/* ---- Mount Manager integration (pure-GPT paging file) ---------------
+   A legacy driver's volumes are invisible to the Mount Manager, so on NT5+
+   (2000/XP) the Memory Manager cannot make them a paging-file target - pure
+   GPT then gets XP's "Limited Virtual Memory" warning. We make each FIXED
+   volume Mount-Manager-aware the non-PnP way: answer the MOUNTDEV query set
+   (device name, a stable unique id, the GPT partition GUID) and post a
+   VOLUME_ARRIVAL_NOTIFICATION to \Device\MountPointManager. The Mount Manager
+   then enumerates the volume, assigns and PERSISTS its drive letter (issue #3,
+   natively) and the paging file works. Removable/hot-plug volumes keep this
+   driver's own letter management (reliable on-the-fly removal, issue #2) and
+   are not handed over - a removable disk is never a paging target anyway. */
+#ifndef FIELD_OFFSET
+#define FIELD_OFFSET(t,f) ((ULONG)(ULONG_PTR)&(((t*)0)->f))
+#endif
+#define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005L)
+#define STATUS_NOT_FOUND       ((NTSTATUS)0xC0000225L)
+
+#define IOCTL_MOUNTDEV_QUERY_UNIQUE_ID           0x004D0000UL
+#define IOCTL_MOUNTDEV_QUERY_DEVICE_NAME         0x004D0008UL
+#define IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME 0x004D0C00UL
+#define IOCTL_MOUNTDEV_LINK_CREATED              0x004D1000UL
+#define IOCTL_MOUNTDEV_LINK_DELETED              0x004D1004UL
+#define IOCTL_MOUNTDEV_QUERY_STABLE_GUID         0x004D2008UL
+#define IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION 0x006D402CUL
+
+typedef struct { USHORT UniqueIdLength; UCHAR  UniqueId[1]; } MOUNTDEV_UNIQUE_ID;
+typedef struct { USHORT NameLength;     WCHAR  Name[1];     } MOUNTDEV_NAME;
+typedef struct { BOOLEAN UseOnlyIfThereAreNoOtherLinks; USHORT NameLength; WCHAR Name[1]; } MOUNTDEV_SUGGESTED;
+typedef struct { USHORT DeviceNameLength; WCHAR DeviceName[1]; } MOUNTMGR_TARGET;
+
+static int g_MgrPresent;   /* 1 once the Mount Manager has been seen */
+
+static int MountMgrPresent(void)
+{
+    UNICODE_STRING un; NTSTATUS st; PDEVICE_OBJECT dev; PFILE_OBJECT file;
+    if (g_MgrPresent) return 1;
+    if (!NT_SUCCESS(MakeUnicode("\\Device\\MountPointManager", &un))) return 0;
+    st = IoGetDeviceObjectPointer(&un, FILE_READ_ATTRIBUTES, &file, &dev);
+    RtlFreeUnicodeString(&un);
+    if (!NT_SUCCESS(st)) return 0;             /* may load later - do not cache absence */
+    ObDereferenceObject(file); g_MgrPresent = 1; return 1;
+}
+
+static void NotifyVolumeArrival(PPART_EXT ext)
+{
+    UNICODE_STRING un; NTSTATUS st; PDEVICE_OBJECT dev; PFILE_OBJECT file;
+    MOUNTMGR_TARGET *tn; int n, i; ULONG sz;
+    if (ext->MgrNotified || !ext->HasKey) return;
+    if (!NT_SUCCESS(MakeUnicode("\\Device\\MountPointManager", &un))) return;
+    st = IoGetDeviceObjectPointer(&un, FILE_READ_ATTRIBUTES, &file, &dev);
+    RtlFreeUnicodeString(&un);
+    if (!NT_SUCCESS(st)) return;
+    for (n = 0; ext->DevName[n]; n++) ;
+    sz = (ULONG)FIELD_OFFSET(MOUNTMGR_TARGET, DeviceName) + (ULONG)n * sizeof(WCHAR);
+    tn = (MOUNTMGR_TARGET *)ExAllocatePool(NonPagedPool, sz);
+    if (tn) {
+        tn->DeviceNameLength = (USHORT)(n * sizeof(WCHAR));
+        for (i = 0; i < n; i++) tn->DeviceName[i] = (WCHAR)(UCHAR)ext->DevName[i];
+        st = SyncIoctl(IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION, dev, tn, sz, NULL, 0);
+        if (NT_SUCCESS(st)) ext->MgrNotified = 1;
+        ExFreePool(tn);
+    }
+    ObDereferenceObject(file);
+}
+
+/* Answer the MOUNTDEV query set for a volume device. Returns 1 if handled. */
+static int MountDevIoctl(PPART_EXT ext, PIRP Irp, ULONG code, PVOID sys, ULONG outlen, NTSTATUS *out)
+{
+    switch (code) {
+    case IOCTL_MOUNTDEV_QUERY_UNIQUE_ID: {
+        MOUNTDEV_UNIQUE_ID *id = (MOUNTDEV_UNIQUE_ID *)sys;
+        USHORT need = 17; ULONG full = (ULONG)FIELD_OFFSET(MOUNTDEV_UNIQUE_ID, UniqueId) + need; int i;
+        if (!ext->HasKey) { *out = Complete(Irp, STATUS_INVALID_PARAMETER, 0); return 1; }
+        if (outlen < full) {
+            if (outlen < sizeof(USHORT)) { *out = Complete(Irp, STATUS_BUFFER_TOO_SMALL, 0); return 1; }
+            id->UniqueIdLength = need; *out = Complete(Irp, STATUS_BUFFER_OVERFLOW, sizeof(USHORT)); return 1;
+        }
+        id->UniqueIdLength = need; id->UniqueId[0] = 'M';            /* driver tag */
+        for (i = 0; i < 16; i++) id->UniqueId[1 + i] = ext->LetterKey[i];
+        *out = Complete(Irp, STATUS_SUCCESS, full); return 1;
+    }
+    case IOCTL_MOUNTDEV_QUERY_DEVICE_NAME: {
+        MOUNTDEV_NAME *nm = (MOUNTDEV_NAME *)sys; int n, i; USHORT bytes; ULONG full;
+        for (n = 0; ext->DevName[n]; n++) ;
+        bytes = (USHORT)(n * sizeof(WCHAR)); full = (ULONG)FIELD_OFFSET(MOUNTDEV_NAME, Name) + bytes;
+        if (outlen < full) {
+            if (outlen < FIELD_OFFSET(MOUNTDEV_NAME, Name) + sizeof(USHORT)) { *out = Complete(Irp, STATUS_BUFFER_TOO_SMALL, 0); return 1; }
+            nm->NameLength = bytes; *out = Complete(Irp, STATUS_BUFFER_OVERFLOW, FIELD_OFFSET(MOUNTDEV_NAME, Name)); return 1;
+        }
+        nm->NameLength = bytes;
+        for (i = 0; i < n; i++) nm->Name[i] = (WCHAR)(UCHAR)ext->DevName[i];
+        *out = Complete(Irp, STATUS_SUCCESS, full); return 1;
+    }
+    case IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME: {
+        MOUNTDEV_SUGGESTED *sl = (MOUNTDEV_SUGGESTED *)sys; WCHAR link[20]; int n = 0, i;
+        const char *p = "\\DosDevices\\"; USHORT bytes; ULONG full;
+        if (!ext->SuggestLetter) { *out = Complete(Irp, STATUS_NOT_FOUND, 0); return 1; }
+        while (p[n]) { link[n] = (WCHAR)p[n]; n++; }
+        link[n++] = (WCHAR)ext->SuggestLetter; link[n++] = (WCHAR)':';
+        bytes = (USHORT)(n * sizeof(WCHAR)); full = (ULONG)FIELD_OFFSET(MOUNTDEV_SUGGESTED, Name) + bytes;
+        if (outlen < full) {
+            if (outlen < FIELD_OFFSET(MOUNTDEV_SUGGESTED, Name)) { *out = Complete(Irp, STATUS_BUFFER_TOO_SMALL, 0); return 1; }
+            sl->UseOnlyIfThereAreNoOtherLinks = TRUE; sl->NameLength = bytes;
+            *out = Complete(Irp, STATUS_BUFFER_OVERFLOW, FIELD_OFFSET(MOUNTDEV_SUGGESTED, Name)); return 1;
+        }
+        sl->UseOnlyIfThereAreNoOtherLinks = TRUE; sl->NameLength = bytes;
+        for (i = 0; i < n; i++) sl->Name[i] = link[i];
+        *out = Complete(Irp, STATUS_SUCCESS, full); return 1;
+    }
+    case IOCTL_MOUNTDEV_QUERY_STABLE_GUID: {
+        int i;
+        if (!ext->IsGpt) { *out = Complete(Irp, STATUS_UNSUCCESSFUL, 0); return 1; }  /* MBR volume: no GUID */
+        if (outlen < 16) { *out = Complete(Irp, STATUS_BUFFER_TOO_SMALL, 0); return 1; }
+        for (i = 0; i < 16; i++) ((UCHAR *)sys)[i] = ext->LetterKey[i];
+        *out = Complete(Irp, STATUS_SUCCESS, 16); return 1;
+    }
+    case IOCTL_MOUNTDEV_LINK_CREATED:
+    case IOCTL_MOUNTDEV_LINK_DELETED:
+        *out = Complete(Irp, STATUS_SUCCESS, 0); return 1;
+    }
+    return 0;
+}
+
+/* Assign a published volume's drive letter (see the Mount Manager note above).
+   hint: a preferred letter (0 = none). Call with ext->HasKey already set. */
+static void PublishLetter(PPART_EXT ext, UCHAR hint)
+{
+    UCHAR want; int removable;
+    if (!ext->HasKey) return;
+    want = RegLookupLetterKey(ext->LetterKey);
+    if (!want && hint) want = hint;
+    removable = (ext->DiskNumber < MGPT_MAXDISK && g_known[ext->DiskNumber].removable);
+    if (!removable && MountMgrPresent()) {
+        ext->SuggestLetter = want;          /* offered via QUERY_SUGGESTED_LINK_NAME */
+        if (want) RegSaveLetterKey(ext->LetterKey, want);
+        NotifyVolumeArrival(ext);           /* Mount Manager owns + persists the letter */
+        return;
+    }
+    if (want) ext->DriveLetter = LinkLetter(want, ext->DevName);
+    if (!ext->DriveLetter) ext->DriveLetter = AssignDriveLetter(ext->DevName);
+    if (ext->DriveLetter) RegSaveLetterKey(ext->LetterKey, ext->DriveLetter);
+}
+
+static int PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNumber, GPT_PARTITION *P, ULONG Bps, gpt_u64 BigFromLba, GPT_DISK *Disk)
 {
     char name[48]; UNICODE_STRING uname; PDEVICE_OBJECT dev, p0dev; PFILE_OBJECT p0file; PPART_EXT ext; NTSTATUS st;
     (void)Part0;
@@ -469,8 +708,10 @@ static int PublishPartition(PDEVICE_OBJECT Part0, ULONG DiskNumber, ULONG PartNu
     dev->StackSize = (CCHAR)(p0dev->StackSize + 1);
     dev->AlignmentRequirement = p0dev->AlignmentRequirement;
     dev->Flags &= ~DO_DEVICE_INITIALIZING;
-    if (P->MbrType != GPT_MBRTYPE_EFISYS && P->MbrType != GPT_MBRTYPE_EXTENDED && P->MbrType != GPT_MBRTYPE_EXTENDL)
-        ext->DriveLetter = AssignDriveLetter(name);
+    if (P->MbrType != GPT_MBRTYPE_EFISYS && P->MbrType != GPT_MBRTYPE_EXTENDED && P->MbrType != GPT_MBRTYPE_EXTENDL) {
+        VolumeKey(P, Disk, ext->LetterKey); ext->HasKey = 1; ext->IsGpt = P->IsGptEntry ? 1 : 0;
+        PublishLetter(ext, 0);
+    }
     LockList(); ext->Next = g_PartList; g_PartList = ext; UnlockList();
     D("  "); D(name); D(" type="); DH(P->MbrType); D(" letter="); DH(ext->DriveLetter); D("\n");
     return 1;
@@ -1374,7 +1615,7 @@ static int SyncDisk(ULONG DiskNumber)
             for (p = g_PartList; p; p = p->Next)
                 if (p->DiskNumber == DiskNumber && !p->Stale && (gpt_u64)p->StartingOffset.QuadPart == off) { have = 1; break; }
             UnlockList();
-            if (!have) added += PublishPartition(part0, DiskNumber, FirstFreePartitionIndex(DiskNumber), g, bps, disk->DriverSectors);
+            if (!have) added += PublishPartition(part0, DiskNumber, FirstFreePartitionIndex(DiskNumber), g, bps, disk->DriverSectors, disk);
         }
         ObDereferenceObject(file);
     }
@@ -1811,10 +2052,13 @@ static void LdmPublish(LDMGRP *g, int vi, LDM_VMAP *m)
     dev->StackSize = stack;
     dev->AlignmentRequirement = align;
     dev->Flags &= ~DO_DEVICE_INITIALIZING;
-    /* the letter the database asks for when it is free, else the first free one */
-    if (v->Hint[0] >= 'C' && v->Hint[0] <= 'Z') ext->DriveLetter = LinkLetter((UCHAR)v->Hint[0], name);
-    else if (v->Hint[0] >= 'c' && v->Hint[0] <= 'z') ext->DriveLetter = LinkLetter((UCHAR)(v->Hint[0] - 32), name);
-    if (!ext->DriveLetter) ext->DriveLetter = AssignDriveLetter(name);
+    /* a persisted letter (issue #3) first, then the one the LDM database
+       asks for when it is free, else the first free one */
+    { int b; UCHAR hint = 0; for (b = 0; b < 16; b++) ext->LetterKey[b] = v->Guid[b]; ext->HasKey = 1; ext->IsGpt = 1;
+      if (v->Hint[0] >= 'C' && v->Hint[0] <= 'Z') hint = (UCHAR)v->Hint[0];
+      else if (v->Hint[0] >= 'c' && v->Hint[0] <= 'z') hint = (UCHAR)(v->Hint[0] - 32);
+      PublishLetter(ext, hint);
+    }
     LockList(); ext->Next = g_PartList; g_PartList = ext; UnlockList();
     D("  "); D(name); D(" "); D(v->Name); D(" letter="); DH(ext->DriveLetter); D("\n");
 }
@@ -1929,7 +2173,13 @@ static int ProbeDisk(ULONG d, DISKID *id)
     id->bps = bps;
     id->total = DiskReach(part0, &geo, 0);
     id->removable = (geo.MediaType == RemovableMedia) ? 1 : 0;
-    if (id->removable) {
+    /* Read sector 0 for EVERY disk, not just removable media (GitHub issue #2):
+       a fixed external disk (e-SATA/USB) that is switched off keeps its device
+       object and answers the geometry from cache, so a geometry-only check
+       never notices it is gone and never re-detects it when it comes back. An
+       actual read fails while the disk is off, so presence is tracked for real;
+       the disk signature / GPT GUID in those sectors also catches a swap. */
+    {
         UCHAR *buf = (UCHAR *)ExAllocatePool(NonPagedPool, 2 * bps);
         LARGE_INTEGER off; UCHAR key[20]; ULONG i;
         if (!buf) { ObDereferenceObject(file); return 0; }
@@ -2015,6 +2265,47 @@ static int SweepStale(void)
 #define DISK_RETRIES 30
 static UCHAR g_retry[MGPT_MAXDISK];
 
+/* case-insensitive equality of a wide string and an ANSI string */
+static int WEqAnsi(const WCHAR *w, const char *a)
+{
+    int i = 0;
+    for (;;) {
+        WCHAR wc = w[i]; char ac = a[i];
+        WCHAR lc = (wc >= 'A' && wc <= 'Z') ? (WCHAR)(wc + 32) : wc;
+        char   la = (ac >= 'A' && ac <= 'Z') ? (char)(ac + 32) : ac;
+        if (lc != (WCHAR)(UCHAR)la) return 0;
+        if (!ac) return 1;
+        i++;
+    }
+}
+
+/* Capture a drive letter changed at run time (issue #3): resolve each
+   \DosDevices\<X>: link and, when it points to one of our owned volumes,
+   record that letter in the registry so the next boot reuses it. */
+static void CaptureLetters(void)
+{
+    UCHAR c; PPART_EXT p; WCHAR buf[280];
+    struct { UCHAR key[16]; UCHAR letter; } save[26]; int ns = 0, j, b;
+    if (!g_RegPath.Buffer) return;
+    for (c = 'C'; c <= 'Z'; c++) {
+        WCHAR link[20]; int i = 0; const char *pfx = "\\DosDevices\\";
+        while (pfx[i]) { link[i] = (WCHAR)(UCHAR)pfx[i]; i++; }
+        link[i++] = (WCHAR)c; link[i++] = (WCHAR)':'; link[i] = 0;
+        if (!NT_SUCCESS(ResolveLink(link, buf, 280))) continue;
+        LockList();
+        for (p = g_PartList; p; p = p->Next) {
+            if (p->Gone || !p->HasKey) continue;
+            if (WEqAnsi(buf, p->DevName)) {
+                if (p->DriveLetter != c) p->DriveLetter = c;
+                if (ns < 26) { for (b = 0; b < 16; b++) save[ns].key[b] = p->LetterKey[b]; save[ns].letter = c; ns++; }
+                break;
+            }
+        }
+        UnlockList();
+    }
+    for (j = 0; j < ns; j++) RegSaveLetterKey(save[j].key, save[j].letter);
+}
+
 /* One pass over all disks. Runs in the disk-check system thread. */
 static void CheckDisks(void)
 {
@@ -2044,6 +2335,7 @@ static void CheckDisks(void)
     if (g_LdmDirty) changed = 1;
     if (changed) { g_LdmDirty = 0; LdmSync(); }
     if (SweepStale()) changed = 1;
+    CaptureLetters();                 /* persist any letter the user changed (issue #3) */
     if (changed) g_Gen++;
     g_PassDone = pass;
     KeSetEvent(&g_ScanLock, 0, FALSE);
@@ -3283,8 +3575,9 @@ static NTSTATUS CreateControlDevice(void)
 
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Driver, PUNICODE_STRING RegPath)
 {
-    HANDLE hThread; NTSTATUS st; (void)RegPath;
+    HANDLE hThread; NTSTATUS st;
     D("MBRGPTNT DriverEntry\n");
+    SaveRegPath(RegPath);                         /* for persistent drive letters (issue #3) */
     g_Driver = Driver; g_PartList = NULL; g_Control = NULL;
     KeInitializeEvent(&g_Lock, SynchronizationEvent, TRUE);
     KeInitializeEvent(&g_SyncLock, SynchronizationEvent, TRUE);
