@@ -40,6 +40,14 @@ connected before start-up).
   activates the paging file. `ErrorControl` stays *Normal*, so a load
   failure is logged and boot continues; `DriverEntry` does no disk work
   (enumeration is deferred to a worker thread), so early load order is safe.
+  The service is left ungrouped, so it initialises after every named group
+  (i.e. after the disk stack) on NT 3.1 - XP alike. The enumerator now runs
+  its **first pass immediately** (no up-front delay) and polls fast until the
+  first volume appears, so a pure-GPT system or paging volume is lettered
+  before the session manager creates the paging file. This matters most on
+  NT 3.x/4.0, where there is no PnP or Mount Manager to retry: the driver's
+  own persistent drive-letter assignment plus straight pass-through of paging
+  reads/writes gives a working page file on a pure-GPT disk with no PnP at all.
 - **Full PnP on Windows 2000 and later (new 2000/XP 32-bit build).** In
   addition to the non-PnP Mount-Manager path above, the NT5+ builds are a
   real PnP **bus driver**. The installer registers a root-enumerated device

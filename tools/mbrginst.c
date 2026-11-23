@@ -110,7 +110,11 @@ void __stdcall MbrgInstEntry(void){
     dw=1;RegSetValueExA(hk,"Type",0,REG_DWORD,(const BYTE*)&dw,4);         /* SERVICE_KERNEL_DRIVER */
     dw=0;RegSetValueExA(hk,"Start",0,REG_DWORD,(const BYTE*)&dw,4);        /* SERVICE_BOOT_START: load at boot on every OS so GPT system/pagefile volumes exist before the session manager needs them */
     dw=1;RegSetValueExA(hk,"ErrorControl",0,REG_DWORD,(const BYTE*)&dw,4); /* NORMAL: a load failure is logged, boot continues */
-    RegSetValueExA(hk,"Group",0,REG_SZ,(const BYTE*)"Boot Bus Extender",18);
+    /* No LoadOrderGroup: an ungrouped boot-start driver initialises after
+       every named group on NT 3.1 - XP alike, i.e. after the disk stack, so
+       Partition0 is openable. (The NT5-only "Boot Bus Extender" group name
+       would mean nothing on NT 3.x/4.0 anyway.) Work is deferred to the enum
+       thread, so this init order is never on a disk-access path. */
     RegCloseKey(hk);
     outs("  registered as a boot-start driver (Start=0)\r\n");
     /* NT 5.0 (2000) and later: register a root-enumerated PnP device whose

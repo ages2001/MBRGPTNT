@@ -3615,14 +3615,21 @@ static NTSTATUS ControlIoctl(PIRP Irp, ULONG Code, PVOID Sys, ULONG InLen, ULONG
    asks (IOCTL_MGPT_RESCAN). Never ends: there is no unload. */
 static VOID NTAPI EnumThread(PVOID Context)
 {
-    LARGE_INTEGER delay; (void)Context;
-    delay.QuadPart = -20000000;
-    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    LARGE_INTEGER delay; int warm = 0; (void)Context;
     D("MBRGPTNT enum thread\n");
     g_PollRunning = 1;
     for (;;) {
+        /* Enumerate immediately on the first pass (no up-front delay): as a
+           boot-start driver this runs once the disk stack is ready, and a
+           pure-GPT system or paging volume must be lettered before the
+           session manager (smss) creates the paging file - otherwise, on
+           NT 3.x / 4.0 where there is no PnP or Mount Manager to retry, that
+           first boot comes up with no page file on the GPT volume. So while
+           no volume has appeared yet, poll fast (200 ms, up to ~6 s) to catch
+           the disk as soon as it is ready; then settle to the normal 2 s. */
         CheckDisks();
-        delay.QuadPart = -20000000;                   /* 2 s */
+        if (warm < 30 && g_PartList == NULL) { warm++; delay.QuadPart = -2000000; }  /* 200 ms */
+        else { warm = 30; delay.QuadPart = -20000000; }                               /* 2 s */
         KeWaitForSingleObject(&g_ScanReq, Executive, KernelMode, FALSE, &delay);
     }
 }
