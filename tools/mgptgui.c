@@ -359,7 +359,6 @@ static void sjoin(char*d,const char*s){if(d[0])scat(d,", ");scat(d,s);}
    udiv64, as the tools link no C run-time. */
 static DWORD u64lo(mgpt_u64 v){ return (DWORD)(v&0xFFFFFFFFu); }
 static int   mbShift(DWORD ss){ int k=20; while(ss>1&&k>0){ ss>>=1; k--; } return k; }
-static DWORD perMB(DWORD ss){ return 1UL<<mbShift(ss); }
 static mgpt_u64 toMB(mgpt_u64 sectors, DWORD ss){ return sectors>>mbShift(ss); }
 static mgpt_u64 udiv64(mgpt_u64 n, mgpt_u64 d){
     mgpt_u64 q=0, r=0; int i;
